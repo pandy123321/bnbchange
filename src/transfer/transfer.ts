@@ -1,12 +1,29 @@
 import { ethers } from "ethers";
 import type { TransferRecipient, TransferResult } from "../types";
+import { assertExpectedChain } from "../utils/chain";
 import { safeErrorMessage } from "../utils/error";
 
 export async function runBatchTransfer(
   wallet: ethers.Wallet,
   recipients: TransferRecipient[],
+  expectedChainId: number,
   onUpdate: (index: number, result: TransferResult) => void
 ): Promise<void> {
+  // 资金执行层自校验：广播前再次核验实际 Chain ID（Fail Closed）
+  try {
+    await assertExpectedChain(wallet.provider!, expectedChainId);
+  } catch (error) {
+    for (let i = 0; i < recipients.length; i++) {
+      onUpdate(i, {
+        address: recipients[i].address,
+        amount: recipients[i].amountText,
+        status: "failed",
+        error: safeErrorMessage(error),
+      });
+    }
+    return;
+  }
+
   for (let i = 0; i < recipients.length; i++) {
     const recipient = recipients[i];
 

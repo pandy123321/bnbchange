@@ -54,6 +54,11 @@ export async function runCopyTrade(
 
   // Leader 失败/未确认 → 停止，Followers 全部标记 skipped
   if (leaderRes.status !== "success") {
+    const reason =
+      leaderRes.status === "unknown"
+        ? "Leader 交易已广播但状态未确认，Followers 未执行"
+        : "Leader 买入失败，Followers 未执行";
+
     for (let i = 0; i < config.followers.length; i++) {
       const follower = config.followers[i];
       onUpdate(i + 1, {
@@ -62,7 +67,7 @@ export async function runCopyTrade(
         address: follower.wallet.address,
         buyAmount: follower.amountText,
         status: "skipped",
-        error: "Leader 买入失败，未执行",
+        error: reason,
       });
     }
     return;

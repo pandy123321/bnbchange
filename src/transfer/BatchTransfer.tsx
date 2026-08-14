@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { ethers } from "ethers";
 import type { NetworkConfig } from "../config/networks";
 import type { TransferRecipient, TransferResult } from "../types";
@@ -11,6 +11,7 @@ import {
 import { runBatchTransfer } from "./transfer";
 import { exportTransferCsv } from "../utils/csv";
 import { txExplorerUrl } from "../utils/explorer";
+import { assertExpectedChain } from "../utils/chain";
 import { safeErrorMessage } from "../utils/error";
 
 function StatusBadge({ status }: { status: TransferResult["status"] }) {
@@ -49,6 +50,7 @@ export function BatchTransfer({
   const [results, setResults] = useState<TransferResult[]>([]);
   const [isExecuting, setIsExecuting] = useState(false);
   const [error, setError] = useState("");
+  const executionRef = useRef(false);
 
   function handlePrivateKeyChange(value: string) {
     setPrivateKey(value);
@@ -105,23 +107,28 @@ export function BatchTransfer({
   }
 
   async function start() {
-    if (!rpcReady) {
-      setError("RPC 网络未就绪，禁止发起交易");
-      return;
-    }
-    if (!wallet) {
-      setError("请先导入 Sender Private Key");
-      return;
-    }
-    if (!parsed) {
-      setError("请先点击 Validate 校验收款列表");
-      return;
-    }
+    if (executionRef.current) return;
+    executionRef.current = true;
+    setIsExecuting(true);
+    onExecutingChange(true);
 
-    setError("");
-
-    // 余额 + Gas 预检：首笔广播前重新读余额并估算总 Gas（Fail Closed）
     try {
+      if (!rpcReady) {
+        setError("RPC 网络未就绪，禁止发起交易");
+        return;
+      }
+      if (!wallet) {
+        setError("请先导入 Sender Private Key");
+        return;
+      }
+      if (!parsed) {
+        setError("请先点击 Validate 校验收款列表");
+        return;
+      }
+
+      setError("");
+
+      // 余额 + Gas 预检：首笔广播前重新读余额并估算总 Gas（Fail Closed）
       const currentBalance = await getWalletBalance(wallet.address, provider);
       let totalGasCost = 0n;
       for (const r of parsed) {
@@ -142,30 +149,33 @@ export function BatchTransfer({
         );
         return;
       }
+
+      // 广播前再次核验实际 Chain ID（Fail Closed）
+      await assertExpectedChain(provider, network.chainId);
+
+      const initial: TransferResult[] = parsed.map((r) => ({
+        address: r.address,
+        amount: r.amountText,
+        status: "processing",
+      }));
+      setResults(initial);
+
+      await runBatchTransfer(
+        wallet,
+        parsed,
+        network.chainId,
+        (index, result) => {
+          setResults((prev) => {
+            const next = [...prev];
+            next[index] = result;
+            return next;
+          });
+        }
+      );
     } catch (e) {
-      setError(`预检失败：${safeErrorMessage(e)}`);
-      return;
-    }
-
-    setIsExecuting(true);
-    onExecutingChange(true);
-
-    const initial: TransferResult[] = parsed.map((r) => ({
-      address: r.address,
-      amount: r.amountText,
-      status: "processing",
-    }));
-    setResults(initial);
-
-    try {
-      await runBatchTransfer(wallet, parsed, (index, result) => {
-        setResults((prev) => {
-          const next = [...prev];
-          next[index] = result;
-          return next;
-        });
-      });
+      setError(safeErrorMessage(e));
     } finally {
+      executionRef.current = false;
       setIsExecuting(false);
       onExecutingChange(false);
     }

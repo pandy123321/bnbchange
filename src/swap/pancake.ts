@@ -1,6 +1,7 @@
 import { ethers } from "ethers";
 import type { NetworkConfig } from "../config/networks";
 import type { SimpleTxStatus } from "../types";
+import { assertExpectedChain } from "../utils/chain";
 import { safeErrorMessage } from "../utils/error";
 import { ERC20_MIN_ABI, PANCAKE_ROUTER_V2_ABI } from "./abi";
 
@@ -69,6 +70,9 @@ export async function buyToken(params: BuyParams): Promise<BuyResult> {
   let amountOutMin = 0n;
 
   try {
+    // 广播前再次核验实际 Chain ID（Fail Closed）
+    await assertExpectedChain(params.wallet.provider!, params.network.chainId);
+
     const router = getRouter(params.network, params.wallet);
     const wbnb = await router.WETH();
     const path = [wbnb, params.tokenAddress];

@@ -1,12 +1,10 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { ethers } from "ethers";
 import type { NetworkConfig } from "../config/networks";
 import type { CopyTradeResult, FollowerConfig } from "../types";
 import { createWallet, getWalletBalance } from "../wallet/wallet";
 import {
   estimateBuyGasCost,
-  getQuote,
-  getRouter,
   getTokenMetadata,
   type TokenMetadata,
 } from "./pancake";
@@ -102,6 +100,7 @@ export function CopyTrade({
   const [isExecuting, setIsExecuting] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const executionRef = useRef(false);
 
   function handleLeaderPrivateKeyChange(value: string) {
     setLeaderPrivateKey(value);
@@ -229,11 +228,11 @@ export function CopyTrade({
       slippageBps = 0n;
     }
 
-    // Gas 预检（Fail Closed）+ 余额刷新
-    let gasCost = 0n;
+    // Leader Gas 预检（Fail Closed）+ 余额刷新
+    let leaderGasCost = 0n;
     if (rpcReady && leaderWallet && leaderWei > 0n && tokenOk && slippageBps > 0n) {
       try {
-        gasCost = await estimateBuyGasCost(
+        leaderGasCost = await estimateBuyGasCost(
           leaderWallet,
           network,
           tokenMeta!.address,
@@ -241,8 +240,8 @@ export function CopyTrade({
           supportFeeOnTransfer
         );
       } catch {
-        problems.push("无法估算交易 Gas（报价/流动性异常），已阻止执行");
-        gasCost = 0n;
+        problems.push("无法估算 Leader 交易 Gas（报价/流动性异常），已阻止执行");
+        leaderGasCost = 0n;
       }
     }
 
@@ -250,9 +249,9 @@ export function CopyTrade({
     if (leaderWallet && leaderWei > 0n) {
       try {
         const bal = await getWalletBalance(leaderWallet.address, provider);
-        if (bal < leaderWei + gasCost) {
+        if (bal < leaderWei + leaderGasCost) {
           problems.push(
-            `Leader BNB 余额不足（需 ${ethers.formatEther(leaderWei + gasCost)}，当前 ${ethers.formatEther(bal)}）`
+            `Leader BNB 余额不足（需 ${ethers.formatEther(leaderWei + leaderGasCost)}，当前 ${ethers.formatEther(bal)}）`
           );
         } else {
           messages.push(`Leader 余额充足`);
@@ -262,19 +261,27 @@ export function CopyTrade({
       }
     }
 
-    // Followers 余额 + Gas
-    if (followers.length > 0 && gasCost > 0n) {
+    // 每个 Follower 独立 Gas 估算 + 余额检查
+    if (followers.length > 0 && tokenOk && slippageBps > 0n) {
       for (const f of followers) {
         if (f.buyAmountWei <= 0n) continue;
         try {
+          const fw = createWallet(f.privateKey, provider);
+          const followerGasCost = await estimateBuyGasCost(
+            fw,
+            network,
+            tokenMeta!.address,
+            f.buyAmountWei,
+            supportFeeOnTransfer
+          );
           const bal = await getWalletBalance(f.address, provider);
-          if (bal < f.buyAmountWei + gasCost) {
+          if (bal < f.buyAmountWei + followerGasCost) {
             problems.push(
-              `${f.name} BNB 余额不足（需 ${ethers.formatEther(f.buyAmountWei + gasCost)}，当前 ${ethers.formatEther(bal)}）`
+              `${f.name} BNB 余额不足（需 ${ethers.formatEther(f.buyAmountWei + followerGasCost)}，当前 ${ethers.formatEther(bal)}）`
             );
           }
         } catch (e) {
-          problems.push(`${f.name} 余额检查失败：${safeErrorMessage(e)}`);
+          problems.push(`${f.name} Gas 预检失败：${safeErrorMessage(e)}`);
         }
       }
     }
@@ -297,48 +304,51 @@ export function CopyTrade({
   }
 
   async function start() {
-    setError("");
-    setMessage("");
-    const check = await precheck();
-    if (!check.ok) {
-      setError(check.messages.join("；"));
-      return;
-    }
-
-    const slippageBps = slippagePercentToBps(slippageText);
-    const leaderWei = ethers.parseEther(leaderAmountText);
-
-    const leader: CopyTradeWallet = {
-      role: "leader",
-      name: "Leader",
-      wallet: leaderWallet!,
-      amountWei: leaderWei,
-      amountText: leaderAmountText,
-    };
-
-    const followerWallets: CopyTradeWallet[] = followers.map((f) => ({
-      role: "follower",
-      name: f.name,
-      wallet: createWallet(f.privateKey, provider),
-      amountWei: f.buyAmountWei,
-      amountText: f.buyAmountText,
-    }));
-
-    const initial: CopyTradeResult[] = [
-      { role: "leader", name: "Leader", address: leaderWallet!.address, buyAmount: leaderAmountText, status: "processing" },
-      ...followerWallets.map((f) => ({
-        role: "follower" as const,
-        name: f.name,
-        address: f.wallet.address,
-        buyAmount: f.amountText,
-        status: "processing" as const,
-      })),
-    ];
-    setResults(initial);
-
+    if (executionRef.current) return;
+    executionRef.current = true;
     setIsExecuting(true);
     onExecutingChange(true);
+
     try {
+      setError("");
+      setMessage("");
+      const check = await precheck();
+      if (!check.ok) {
+        setError(check.messages.join("；"));
+        return;
+      }
+
+      const slippageBps = slippagePercentToBps(slippageText);
+      const leaderWei = ethers.parseEther(leaderAmountText);
+
+      const leader: CopyTradeWallet = {
+        role: "leader",
+        name: "Leader",
+        wallet: leaderWallet!,
+        amountWei: leaderWei,
+        amountText: leaderAmountText,
+      };
+
+      const followerWallets: CopyTradeWallet[] = followers.map((f) => ({
+        role: "follower",
+        name: f.name,
+        wallet: createWallet(f.privateKey, provider),
+        amountWei: f.buyAmountWei,
+        amountText: f.buyAmountText,
+      }));
+
+      const initial: CopyTradeResult[] = [
+        { role: "leader", name: "Leader", address: leaderWallet!.address, buyAmount: leaderAmountText, status: "processing" },
+        ...followerWallets.map((f) => ({
+          role: "follower" as const,
+          name: f.name,
+          address: f.wallet.address,
+          buyAmount: f.amountText,
+          status: "processing" as const,
+        })),
+      ];
+      setResults(initial);
+
       await runCopyTrade(
         {
           tokenAddress: tokenMeta!.address,
@@ -356,7 +366,10 @@ export function CopyTrade({
           });
         }
       );
+    } catch (e) {
+      setError(safeErrorMessage(e));
     } finally {
+      executionRef.current = false;
       setIsExecuting(false);
       onExecutingChange(false);
     }
