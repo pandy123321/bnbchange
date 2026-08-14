@@ -121,6 +121,12 @@ export function CopyTrade({
     setTokenMeta(null);
   }
 
+  function handleDefaultAmountChange(value: string) {
+    setDefaultAmountText(value);
+    // Default Buy 变化 → 旧 followers（已写入旧金额）立即失效，要求重新 Parse
+    setFollowers([]);
+  }
+
   async function loadLeader() {
     setError("");
     setLeaderWallet(null);
@@ -391,8 +397,9 @@ export function CopyTrade({
                 type="password"
                 value={leaderPrivateKey}
                 onChange={(e) => handleLeaderPrivateKeyChange(e.target.value)}
+                disabled={isExecuting}
                 placeholder="0x..."
-                className="flex-1 px-3 py-2 rounded-md bg-gray-800 border border-gray-700 font-mono focus:outline-none focus:border-blue-500"
+                className="flex-1 px-3 py-2 rounded-md bg-gray-800 border border-gray-700 font-mono focus:outline-none focus:border-blue-500 disabled:opacity-50"
               />
               <button
                 onClick={loadLeader}
@@ -422,8 +429,9 @@ export function CopyTrade({
               type="text"
               value={leaderAmountText}
               onChange={(e) => setLeaderAmountText(e.target.value)}
+              disabled={isExecuting}
               placeholder="0.5"
-              className="w-full px-3 py-2 rounded-md bg-gray-800 border border-gray-700 focus:outline-none focus:border-blue-500"
+              className="w-full px-3 py-2 rounded-md bg-gray-800 border border-gray-700 focus:outline-none focus:border-blue-500 disabled:opacity-50"
             />
           </div>
         </div>
@@ -437,9 +445,10 @@ export function CopyTrade({
             <textarea
               value={followersText}
               onChange={(e) => handleFollowersTextChange(e.target.value)}
+              disabled={isExecuting}
               rows={5}
               placeholder={"0xPRIVATEKEY1\n0xPRIVATEKEY2\n0xPRIVATEKEY3"}
-              className="w-full px-3 py-2 rounded-md bg-gray-800 border border-gray-700 font-mono text-sm focus:outline-none focus:border-blue-500"
+              className="w-full px-3 py-2 rounded-md bg-gray-800 border border-gray-700 font-mono text-sm focus:outline-none focus:border-blue-500 disabled:opacity-50"
             />
           </div>
           <div>
@@ -447,9 +456,10 @@ export function CopyTrade({
             <input
               type="text"
               value={defaultAmountText}
-              onChange={(e) => setDefaultAmountText(e.target.value)}
+              onChange={(e) => handleDefaultAmountChange(e.target.value)}
+              disabled={isExecuting}
               placeholder="0.1"
-              className="w-full px-3 py-2 rounded-md bg-gray-800 border border-gray-700 focus:outline-none focus:border-blue-500"
+              className="w-full px-3 py-2 rounded-md bg-gray-800 border border-gray-700 focus:outline-none focus:border-blue-500 disabled:opacity-50"
             />
             <button
               onClick={parseFollowers}
@@ -485,7 +495,8 @@ export function CopyTrade({
                         type="text"
                         value={f.buyAmountText}
                         onChange={(e) => updateFollowerAmount(f.id, e.target.value)}
-                        className="w-20 px-2 py-1 rounded-md bg-gray-800 border border-gray-700 text-sm focus:outline-none focus:border-blue-500"
+                        disabled={isExecuting}
+                        className="w-20 px-2 py-1 rounded-md bg-gray-800 border border-gray-700 text-sm focus:outline-none focus:border-blue-500 disabled:opacity-50"
                       />
                     </td>
                   </tr>
@@ -506,8 +517,9 @@ export function CopyTrade({
                 type="text"
                 value={tokenAddress}
                 onChange={(e) => handleTokenAddressChange(e.target.value)}
+                disabled={isExecuting}
                 placeholder="0xTOKEN..."
-                className="flex-1 px-3 py-2 rounded-md bg-gray-800 border border-gray-700 font-mono focus:outline-none focus:border-blue-500"
+                className="flex-1 px-3 py-2 rounded-md bg-gray-800 border border-gray-700 font-mono focus:outline-none focus:border-blue-500 disabled:opacity-50"
               />
               <button
                 onClick={loadToken}
@@ -529,7 +541,8 @@ export function CopyTrade({
               type="text"
               value={slippageText}
               onChange={(e) => setSlippageText(e.target.value)}
-              className="w-full px-3 py-2 rounded-md bg-gray-800 border border-gray-700 focus:outline-none focus:border-blue-500"
+              disabled={isExecuting}
+              className="w-full px-3 py-2 rounded-md bg-gray-800 border border-gray-700 focus:outline-none focus:border-blue-500 disabled:opacity-50"
             />
           </div>
           <div className="flex items-end pb-1">
@@ -538,6 +551,7 @@ export function CopyTrade({
                 type="checkbox"
                 checked={supportFeeOnTransfer}
                 onChange={(e) => setSupportFeeOnTransfer(e.target.checked)}
+                disabled={isExecuting}
                 className="accent-blue-600"
               />
               Fee-on-Transfer 兼容模式

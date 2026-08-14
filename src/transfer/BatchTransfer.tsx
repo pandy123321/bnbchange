@@ -195,8 +195,9 @@ export function BatchTransfer({
             type="password"
             value={privateKey}
             onChange={(e) => handlePrivateKeyChange(e.target.value)}
+            disabled={isExecuting}
             placeholder="0x..."
-            className="flex-1 px-3 py-2 rounded-md bg-gray-800 border border-gray-700 font-mono focus:outline-none focus:border-blue-500"
+            className="flex-1 px-3 py-2 rounded-md bg-gray-800 border border-gray-700 font-mono focus:outline-none focus:border-blue-500 disabled:opacity-50"
           />
           <button
             onClick={loadWallet}
@@ -230,9 +231,10 @@ export function BatchTransfer({
         <textarea
           value={recipientsText}
           onChange={(e) => handleRecipientsChange(e.target.value)}
+          disabled={isExecuting}
           rows={6}
           placeholder={"0xAAA...,0.1\n0xBBB...,0.25\n0xCCC...,0.5"}
-          className="w-full px-3 py-2 rounded-md bg-gray-800 border border-gray-700 font-mono text-sm focus:outline-none focus:border-blue-500"
+          className="w-full px-3 py-2 rounded-md bg-gray-800 border border-gray-700 font-mono text-sm focus:outline-none focus:border-blue-500 disabled:opacity-50"
         />
 
         <div className="mt-3 flex items-center gap-3">

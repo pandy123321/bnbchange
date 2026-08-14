@@ -2,7 +2,7 @@ import { ethers } from "ethers";
 import type { NetworkConfig } from "../config/networks";
 import type { SimpleTxStatus } from "../types";
 import { assertExpectedChain } from "../utils/chain";
-import { safeErrorMessage } from "../utils/error";
+import { isConfirmedRevert, safeErrorMessage } from "../utils/error";
 import { ERC20_MIN_ABI, PANCAKE_ROUTER_V2_ABI } from "./abi";
 
 export interface TokenMetadata {
@@ -119,10 +119,16 @@ export async function buyToken(params: BuyParams): Promise<BuyResult> {
       error: "Transaction reverted",
     };
   } catch (error) {
-    // 已广播但 receipt 无法确认 → unknown，保留 txHash
+    // 已广播但 receipt 无法确认 → unknown，保留 txHash；
+    // 已确认 revert（CALL_EXCEPTION 且 receipt.status === 0）→ failed
+    const status = hash
+      ? isConfirmedRevert(error)
+        ? "failed"
+        : "unknown"
+      : "failed";
     return {
       hash,
-      status: hash ? "unknown" : "failed",
+      status,
       amountOutMin,
       error: safeErrorMessage(error),
     };

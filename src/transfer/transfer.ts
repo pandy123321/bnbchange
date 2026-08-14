@@ -1,7 +1,7 @@
 import { ethers } from "ethers";
 import type { TransferRecipient, TransferResult } from "../types";
 import { assertExpectedChain } from "../utils/chain";
-import { safeErrorMessage } from "../utils/error";
+import { isConfirmedRevert, safeErrorMessage } from "../utils/error";
 
 export async function runBatchTransfer(
   wallet: ethers.Wallet,
@@ -69,11 +69,17 @@ export async function runBatchTransfer(
         });
       }
     } catch (error) {
-      // 已广播（取得 txHash）但 receipt 无法确认 → unknown，必须保留 txHash
+      // 已广播（取得 txHash）但 receipt 无法确认 → unknown，必须保留 txHash；
+      // 若已确认 revert（CALL_EXCEPTION 且 receipt.status === 0）→ failed
+      const status = txHash
+        ? isConfirmedRevert(error)
+          ? "failed"
+          : "unknown"
+        : "failed";
       onUpdate(i, {
         address: recipient.address,
         amount: recipient.amountText,
-        status: txHash ? "unknown" : "failed",
+        status,
         txHash,
         error: safeErrorMessage(error),
       });

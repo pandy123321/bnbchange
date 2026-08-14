@@ -1,3 +1,5 @@
+import { ethers } from "ethers";
+
 const PATTERNS: Array<[RegExp, string]> = [
   [/insufficient funds/i, "BNB 余额不足"],
   [/invalid private key/i, "Private Key 无效"],
@@ -34,4 +36,10 @@ export function safeErrorMessage(error: unknown): string {
   }
 
   return text || "未知错误";
+}
+
+export function isConfirmedRevert(error: unknown): boolean {
+  if (!ethers.isError(error, "CALL_EXCEPTION")) return false;
+  const callError = error as ethers.CallExceptionError;
+  return callError.receipt != null && callError.receipt.status === 0;
 }
