@@ -15,7 +15,12 @@ export interface TransferRecipient {
   amountWei: bigint;
 }
 
-export type SimpleTxStatus = "processing" | "success" | "failed";
+export type SimpleTxStatus =
+  | "processing"
+  | "success"
+  | "failed"
+  | "unknown"
+  | "skipped";
 
 export interface TransferResult {
   address: string;

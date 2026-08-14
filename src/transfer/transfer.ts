@@ -16,17 +16,21 @@ export async function runBatchTransfer(
       status: "processing",
     });
 
+    let txHash: string | undefined;
+
     try {
       const tx = await wallet.sendTransaction({
         to: recipient.address,
         value: recipient.amountWei,
       });
 
+      txHash = tx.hash;
+
       onUpdate(i, {
         address: recipient.address,
         amount: recipient.amountText,
         status: "processing",
-        txHash: tx.hash,
+        txHash,
       });
 
       const receipt = await tx.wait();
@@ -36,22 +40,24 @@ export async function runBatchTransfer(
           address: recipient.address,
           amount: recipient.amountText,
           status: "success",
-          txHash: tx.hash,
+          txHash,
         });
       } else {
         onUpdate(i, {
           address: recipient.address,
           amount: recipient.amountText,
           status: "failed",
-          txHash: tx.hash,
+          txHash,
           error: "Transaction reverted",
         });
       }
     } catch (error) {
+      // 已广播（取得 txHash）但 receipt 无法确认 → unknown，必须保留 txHash
       onUpdate(i, {
         address: recipient.address,
         amount: recipient.amountText,
-        status: "failed",
+        status: txHash ? "unknown" : "failed",
+        txHash,
         error: safeErrorMessage(error),
       });
       // V0.1 不自动 Retry，继续下一笔

@@ -1,7 +1,6 @@
 import type { Wallet } from "ethers";
 import type { NetworkConfig } from "../config/networks";
 import type { CopyTradeResult } from "../types";
-import { safeErrorMessage } from "../utils/error";
 import { buyToken } from "./pancake";
 
 export interface CopyTradeWallet {
@@ -34,37 +33,38 @@ export async function runCopyTrade(
     status: "processing",
   });
 
-  try {
-    const res = await buyToken({
-      wallet: config.leader.wallet,
-      tokenAddress: config.tokenAddress,
-      amountInWei: config.leader.amountWei,
-      slippageBps: config.slippageBps,
-      network: config.network,
-      supportFeeOnTransfer: config.supportFeeOnTransfer,
-    });
+  const leaderRes = await buyToken({
+    wallet: config.leader.wallet,
+    tokenAddress: config.tokenAddress,
+    amountInWei: config.leader.amountWei,
+    slippageBps: config.slippageBps,
+    network: config.network,
+    supportFeeOnTransfer: config.supportFeeOnTransfer,
+  });
 
-    onUpdate(0, {
-      role: "leader",
-      name: config.leader.name,
-      address: config.leader.wallet.address,
-      buyAmount: config.leader.amountText,
-      status: res.success ? "success" : "failed",
-      txHash: res.hash,
-      error: res.success ? undefined : "Transaction reverted",
-    });
+  onUpdate(0, {
+    role: "leader",
+    name: config.leader.name,
+    address: config.leader.wallet.address,
+    buyAmount: config.leader.amountText,
+    status: leaderRes.status,
+    txHash: leaderRes.hash,
+    error: leaderRes.error,
+  });
 
-    // Leader 失败 → 立即停止，Followers 全部不执行
-    if (!res.success) return;
-  } catch (error) {
-    onUpdate(0, {
-      role: "leader",
-      name: config.leader.name,
-      address: config.leader.wallet.address,
-      buyAmount: config.leader.amountText,
-      status: "failed",
-      error: safeErrorMessage(error),
-    });
+  // Leader 失败/未确认 → 停止，Followers 全部标记 skipped
+  if (leaderRes.status !== "success") {
+    for (let i = 0; i < config.followers.length; i++) {
+      const follower = config.followers[i];
+      onUpdate(i + 1, {
+        role: "follower",
+        name: follower.name,
+        address: follower.wallet.address,
+        buyAmount: follower.amountText,
+        status: "skipped",
+        error: "Leader 买入失败，未执行",
+      });
+    }
     return;
   }
 
@@ -81,35 +81,24 @@ export async function runCopyTrade(
       status: "processing",
     });
 
-    try {
-      const res = await buyToken({
-        wallet: follower.wallet,
-        tokenAddress: config.tokenAddress,
-        amountInWei: follower.amountWei,
-        slippageBps: config.slippageBps,
-        network: config.network,
-        supportFeeOnTransfer: config.supportFeeOnTransfer,
-      });
+    const res = await buyToken({
+      wallet: follower.wallet,
+      tokenAddress: config.tokenAddress,
+      amountInWei: follower.amountWei,
+      slippageBps: config.slippageBps,
+      network: config.network,
+      supportFeeOnTransfer: config.supportFeeOnTransfer,
+    });
 
-      onUpdate(index, {
-        role: "follower",
-        name: follower.name,
-        address: follower.wallet.address,
-        buyAmount: follower.amountText,
-        status: res.success ? "success" : "failed",
-        txHash: res.hash,
-        error: res.success ? undefined : "Transaction reverted",
-      });
-    } catch (error) {
-      onUpdate(index, {
-        role: "follower",
-        name: follower.name,
-        address: follower.wallet.address,
-        buyAmount: follower.amountText,
-        status: "failed",
-        error: safeErrorMessage(error),
-      });
-      // 不 Retry，继续后续 Follower
-    }
+    onUpdate(index, {
+      role: "follower",
+      name: follower.name,
+      address: follower.wallet.address,
+      buyAmount: follower.amountText,
+      status: res.status,
+      txHash: res.hash,
+      error: res.error,
+    });
+    // 不 Retry，继续后续 Follower
   }
 }

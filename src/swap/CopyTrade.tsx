@@ -4,6 +4,7 @@ import type { NetworkConfig } from "../config/networks";
 import type { CopyTradeResult, FollowerConfig } from "../types";
 import { createWallet, getWalletBalance } from "../wallet/wallet";
 import {
+  estimateBuyGasCost,
   getQuote,
   getRouter,
   getTokenMetadata,
@@ -19,6 +20,8 @@ function StatusBadge({ status }: { status: CopyTradeResult["status"] }) {
     processing: ["bg-yellow-500/15 text-yellow-300", "处理中"],
     success: ["bg-green-500/15 text-green-300", "成功"],
     failed: ["bg-red-500/15 text-red-300", "失败"],
+    unknown: ["bg-orange-500/15 text-orange-300", "已广播待确认"],
+    skipped: ["bg-gray-500/15 text-gray-400", "未执行"],
   } as const;
   const [cls, label] = map[status];
   return (
@@ -73,9 +76,13 @@ async function buildFollowers(
 export function CopyTrade({
   network,
   provider,
+  rpcReady,
+  onExecutingChange,
 }: {
   network: NetworkConfig;
   provider: ethers.Provider;
+  rpcReady: boolean;
+  onExecutingChange: (executing: boolean) => void;
 }) {
   const [leaderPrivateKey, setLeaderPrivateKey] = useState("");
   const [leaderWallet, setLeaderWallet] = useState<ethers.Wallet | null>(null);
@@ -95,6 +102,25 @@ export function CopyTrade({
   const [isExecuting, setIsExecuting] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+
+  function handleLeaderPrivateKeyChange(value: string) {
+    setLeaderPrivateKey(value);
+    // 源输入变化 → 旧 leader wallet / 余额立即失效
+    setLeaderWallet(null);
+    setLeaderBalanceWei(null);
+  }
+
+  function handleFollowersTextChange(value: string) {
+    setFollowersText(value);
+    // 源输入变化 → 旧 followers 立即失效
+    setFollowers([]);
+  }
+
+  function handleTokenAddressChange(value: string) {
+    setTokenAddress(value);
+    // 源输入变化 → 旧 token metadata 立即失效
+    setTokenMeta(null);
+  }
 
   async function loadLeader() {
     setError("");
@@ -159,14 +185,16 @@ export function CopyTrade({
     const messages: string[] = [];
     const problems: string[] = [];
 
+    if (!rpcReady) {
+      problems.push("RPC 网络未就绪，禁止发起交易");
+    }
+
+    let leaderWei = 0n;
     try {
       if (!leaderWallet) throw new Error("请先导入 Leader Private Key");
       if (leaderAmountText.trim() === "") throw new Error("请填写 Leader Buy Amount");
-      const leaderWei = ethers.parseEther(leaderAmountText);
+      leaderWei = ethers.parseEther(leaderAmountText);
       if (leaderWei <= 0n) throw new Error("Leader Buy Amount 必须大于 0");
-      if (leaderBalanceWei != null && leaderBalanceWei < leaderWei) {
-        throw new Error("Leader BNB 余额不足");
-      }
       messages.push(`Leader 买入 ${leaderAmountText} ${network.nativeSymbol}`);
     } catch (e) {
       problems.push(safeErrorMessage(e));
@@ -178,16 +206,16 @@ export function CopyTrade({
       for (const f of followers) {
         if (f.buyAmountWei <= 0n) {
           problems.push(`${f.name} 买入金额必须大于 0`);
-        } else if (f.balanceWei < f.buyAmountWei) {
-          problems.push(`${f.name} BNB 余额不足`);
         }
       }
       messages.push(`${followers.length} 个 Follower`);
     }
 
+    let tokenOk = false;
     try {
       if (!tokenMeta) throw new Error("请先读取 Token 信息");
       messages.push(`Token ${tokenMeta.symbol}`);
+      tokenOk = true;
     } catch (e) {
       problems.push(safeErrorMessage(e));
     }
@@ -201,21 +229,54 @@ export function CopyTrade({
       slippageBps = 0n;
     }
 
-    // 报价可用性
-    try {
-      if (leaderWallet && leaderAmountText.trim() !== "") {
-        const router = getRouter(network, leaderWallet);
-        const wbnb = await router.WETH();
-        await getQuote(
-          router,
-          wbnb,
-          tokenMeta?.address ?? "",
-          ethers.parseEther(leaderAmountText)
+    // Gas 预检（Fail Closed）+ 余额刷新
+    let gasCost = 0n;
+    if (rpcReady && leaderWallet && leaderWei > 0n && tokenOk && slippageBps > 0n) {
+      try {
+        gasCost = await estimateBuyGasCost(
+          leaderWallet,
+          network,
+          tokenMeta!.address,
+          leaderWei,
+          supportFeeOnTransfer
         );
-        messages.push("Router 报价可用");
+      } catch {
+        problems.push("无法估算交易 Gas（报价/流动性异常），已阻止执行");
+        gasCost = 0n;
       }
-    } catch {
-      problems.push("无法获取报价，可能无直接流动性");
+    }
+
+    // Leader 余额 + Gas
+    if (leaderWallet && leaderWei > 0n) {
+      try {
+        const bal = await getWalletBalance(leaderWallet.address, provider);
+        if (bal < leaderWei + gasCost) {
+          problems.push(
+            `Leader BNB 余额不足（需 ${ethers.formatEther(leaderWei + gasCost)}，当前 ${ethers.formatEther(bal)}）`
+          );
+        } else {
+          messages.push(`Leader 余额充足`);
+        }
+      } catch (e) {
+        problems.push(`Leader 余额检查失败：${safeErrorMessage(e)}`);
+      }
+    }
+
+    // Followers 余额 + Gas
+    if (followers.length > 0 && gasCost > 0n) {
+      for (const f of followers) {
+        if (f.buyAmountWei <= 0n) continue;
+        try {
+          const bal = await getWalletBalance(f.address, provider);
+          if (bal < f.buyAmountWei + gasCost) {
+            problems.push(
+              `${f.name} BNB 余额不足（需 ${ethers.formatEther(f.buyAmountWei + gasCost)}，当前 ${ethers.formatEther(bal)}）`
+            );
+          }
+        } catch (e) {
+          problems.push(`${f.name} 余额检查失败：${safeErrorMessage(e)}`);
+        }
+      }
     }
 
     if (problems.length > 0) {
@@ -276,6 +337,7 @@ export function CopyTrade({
     setResults(initial);
 
     setIsExecuting(true);
+    onExecutingChange(true);
     try {
       await runCopyTrade(
         {
@@ -296,11 +358,13 @@ export function CopyTrade({
       );
     } finally {
       setIsExecuting(false);
+      onExecutingChange(false);
     }
   }
 
   const successCount = results.filter((r) => r.status === "success").length;
   const failedCount = results.filter((r) => r.status === "failed").length;
+  const unknownCount = results.filter((r) => r.status === "unknown").length;
 
   return (
     <div className="space-y-6">
@@ -313,13 +377,13 @@ export function CopyTrade({
               <input
                 type="password"
                 value={leaderPrivateKey}
-                onChange={(e) => setLeaderPrivateKey(e.target.value)}
+                onChange={(e) => handleLeaderPrivateKeyChange(e.target.value)}
                 placeholder="0x..."
                 className="flex-1 px-3 py-2 rounded-md bg-gray-800 border border-gray-700 font-mono focus:outline-none focus:border-blue-500"
               />
               <button
                 onClick={loadLeader}
-                disabled={isExecuting}
+                disabled={isExecuting || !rpcReady}
                 className="px-4 py-2 rounded-md bg-gray-700 hover:bg-gray-600 disabled:opacity-50"
               >
                 读取
@@ -359,7 +423,7 @@ export function CopyTrade({
             <label className="block text-xs text-gray-400 mb-1">Private Keys（每行一个）</label>
             <textarea
               value={followersText}
-              onChange={(e) => setFollowersText(e.target.value)}
+              onChange={(e) => handleFollowersTextChange(e.target.value)}
               rows={5}
               placeholder={"0xPRIVATEKEY1\n0xPRIVATEKEY2\n0xPRIVATEKEY3"}
               className="w-full px-3 py-2 rounded-md bg-gray-800 border border-gray-700 font-mono text-sm focus:outline-none focus:border-blue-500"
@@ -376,7 +440,7 @@ export function CopyTrade({
             />
             <button
               onClick={parseFollowers}
-              disabled={isExecuting}
+              disabled={isExecuting || !rpcReady}
               className="mt-3 px-4 py-2 rounded-md bg-gray-700 hover:bg-gray-600 disabled:opacity-50"
             >
               Parse Followers
@@ -428,13 +492,13 @@ export function CopyTrade({
               <input
                 type="text"
                 value={tokenAddress}
-                onChange={(e) => setTokenAddress(e.target.value)}
+                onChange={(e) => handleTokenAddressChange(e.target.value)}
                 placeholder="0xTOKEN..."
                 className="flex-1 px-3 py-2 rounded-md bg-gray-800 border border-gray-700 font-mono focus:outline-none focus:border-blue-500"
               />
               <button
                 onClick={loadToken}
-                disabled={isExecuting}
+                disabled={isExecuting || !rpcReady}
                 className="px-4 py-2 rounded-md bg-gray-700 hover:bg-gray-600 disabled:opacity-50"
               >
                 读取
@@ -478,7 +542,7 @@ export function CopyTrade({
           </button>
           <button
             onClick={start}
-            disabled={isExecuting}
+            disabled={isExecuting || !rpcReady}
             className="px-4 py-2 rounded-md bg-blue-600 hover:bg-blue-500 disabled:opacity-50 font-medium"
           >
             {isExecuting ? "执行中..." : "Start Copy Trade"}
@@ -496,6 +560,13 @@ export function CopyTrade({
             <div className="text-sm text-gray-400">
               成功 <span className="text-green-400">{successCount}</span> · 失败{" "}
               <span className="text-red-400">{failedCount}</span>
+              {unknownCount > 0 && (
+                <>
+                  {" "}
+                  · 待确认{" "}
+                  <span className="text-orange-400">{unknownCount}</span>
+                </>
+              )}
             </div>
           </div>
 
@@ -533,6 +604,11 @@ export function CopyTrade({
                         <span className="text-red-400 text-xs">{r.error}</span>
                       ) : (
                         "-"
+                      )}
+                      {r.status === "unknown" && r.txHash && (
+                        <span className="block text-xs text-orange-300 mt-1">
+                          已广播但状态未确认，请先通过 txHash 检查链上结果，勿重复发送
+                        </span>
                       )}
                     </td>
                   </tr>

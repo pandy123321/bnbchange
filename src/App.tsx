@@ -11,16 +11,19 @@ type Tab = "transfer" | "copytrade";
 function TabButton({
   active,
   onClick,
+  disabled,
   children,
 }: {
   active: boolean;
   onClick: () => void;
+  disabled?: boolean;
   children: string;
 }) {
   return (
     <button
       onClick={onClick}
-      className={`px-4 py-2 text-sm font-medium border-b-2 ${
+      disabled={disabled}
+      className={`px-4 py-2 text-sm font-medium border-b-2 disabled:opacity-40 disabled:cursor-not-allowed ${
         active
           ? "border-blue-500 text-gray-100"
           : "border-transparent text-gray-400 hover:text-gray-200"
@@ -36,7 +39,9 @@ export default function App() {
   const [networkKey, setNetworkKey] = useState<NetworkKey>("bsc-testnet");
   const [tab, setTab] = useState<Tab>("transfer");
   const [rpcError, setRpcError] = useState("");
+  const [rpcReady, setRpcReady] = useState(false);
   const [blockNumber, setBlockNumber] = useState<number | null>(null);
+  const [isExecuting, setIsExecuting] = useState(false);
 
   const network = NETWORKS[networkKey];
 
@@ -48,6 +53,7 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
     setRpcError("");
+    setRpcReady(false);
     setBlockNumber(null);
 
     provider
@@ -65,6 +71,7 @@ export default function App() {
       .then((block) => {
         if (cancelled || block == null) return;
         setBlockNumber(block);
+        setRpcReady(true);
       })
       .catch(() => {
         if (!cancelled) setRpcError("无法连接 RPC，请检查网络配置");
@@ -88,7 +95,8 @@ export default function App() {
             <select
               value={networkKey}
               onChange={(e) => setNetworkKey(e.target.value as NetworkKey)}
-              className="bg-gray-800 border border-gray-700 rounded px-2 py-1"
+              disabled={isExecuting}
+              className="bg-gray-800 border border-gray-700 rounded px-2 py-1 disabled:opacity-50"
             >
               <option value="bsc-testnet">BSC Testnet</option>
               <option value="bsc-mainnet">BSC Mainnet</option>
@@ -96,7 +104,7 @@ export default function App() {
             <span className="text-green-400">License ✓</span>
             {rpcError ? (
               <span className="text-red-400">{rpcError}</span>
-            ) : blockNumber != null ? (
+            ) : rpcReady && blockNumber != null ? (
               <span className="text-gray-400">Block #{blockNumber}</span>
             ) : (
               <span className="text-gray-500">连接中...</span>
@@ -104,20 +112,48 @@ export default function App() {
           </div>
         </div>
         <div className="max-w-5xl mx-auto px-4 flex gap-1">
-          <TabButton active={tab === "transfer"} onClick={() => setTab("transfer")}>
+          <TabButton
+            active={tab === "transfer"}
+            onClick={() => setTab("transfer")}
+            disabled={isExecuting}
+          >
             批量转账
           </TabButton>
-          <TabButton active={tab === "copytrade"} onClick={() => setTab("copytrade")}>
+          <TabButton
+            active={tab === "copytrade"}
+            onClick={() => setTab("copytrade")}
+            disabled={isExecuting}
+          >
             带单跟单
           </TabButton>
         </div>
       </header>
 
+      {!rpcReady && (
+        <div className="max-w-5xl mx-auto px-4 pt-4">
+          <div className="rounded-lg border border-red-800 bg-red-900/20 px-4 py-2 text-sm text-red-300">
+            RPC 网络未就绪，所有资金操作已锁定（Fail Closed）。
+          </div>
+        </div>
+      )}
+
       <main className="max-w-5xl mx-auto px-4 py-6">
         {tab === "transfer" ? (
-          <BatchTransfer network={network} provider={provider} />
+          <BatchTransfer
+            key={network.key}
+            network={network}
+            provider={provider}
+            rpcReady={rpcReady}
+            onExecutingChange={setIsExecuting}
+          />
         ) : (
-          <CopyTrade network={network} provider={provider} />
+          <CopyTrade
+            key={network.key}
+            network={network}
+            provider={provider}
+            rpcReady={rpcReady}
+            onExecutingChange={setIsExecuting}
+          />
         )}
       </main>
     </div>

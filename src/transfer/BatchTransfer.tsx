@@ -18,6 +18,8 @@ function StatusBadge({ status }: { status: TransferResult["status"] }) {
     processing: ["bg-yellow-500/15 text-yellow-300", "处理中"],
     success: ["bg-green-500/15 text-green-300", "成功"],
     failed: ["bg-red-500/15 text-red-300", "失败"],
+    unknown: ["bg-orange-500/15 text-orange-300", "已广播待确认"],
+    skipped: ["bg-gray-500/15 text-gray-400", "未执行"],
   } as const;
   const [cls, label] = map[status];
   return (
@@ -30,9 +32,13 @@ function StatusBadge({ status }: { status: TransferResult["status"] }) {
 export function BatchTransfer({
   network,
   provider,
+  rpcReady,
+  onExecutingChange,
 }: {
   network: NetworkConfig;
   provider: ethers.Provider;
+  rpcReady: boolean;
+  onExecutingChange: (executing: boolean) => void;
 }) {
   const [privateKey, setPrivateKey] = useState("");
   const [wallet, setWallet] = useState<ethers.Wallet | null>(null);
@@ -43,6 +49,20 @@ export function BatchTransfer({
   const [results, setResults] = useState<TransferResult[]>([]);
   const [isExecuting, setIsExecuting] = useState(false);
   const [error, setError] = useState("");
+
+  function handlePrivateKeyChange(value: string) {
+    setPrivateKey(value);
+    // 源输入变化 → 旧 wallet / 余额立即失效
+    setWallet(null);
+    setBalanceWei(null);
+  }
+
+  function handleRecipientsChange(value: string) {
+    setRecipientsText(value);
+    // 源输入变化 → 旧 parsed / summary 立即失效
+    setParsed(null);
+    setSummary("");
+  }
 
   async function loadWallet() {
     setError("");
@@ -85,6 +105,10 @@ export function BatchTransfer({
   }
 
   async function start() {
+    if (!rpcReady) {
+      setError("RPC 网络未就绪，禁止发起交易");
+      return;
+    }
     if (!wallet) {
       setError("请先导入 Sender Private Key");
       return;
@@ -95,7 +119,36 @@ export function BatchTransfer({
     }
 
     setError("");
+
+    // 余额 + Gas 预检：首笔广播前重新读余额并估算总 Gas（Fail Closed）
+    try {
+      const currentBalance = await getWalletBalance(wallet.address, provider);
+      let totalGasCost = 0n;
+      for (const r of parsed) {
+        const gasLimit = await wallet.estimateGas({
+          to: r.address,
+          value: r.amountWei,
+        });
+        const feeData = await provider.getFeeData();
+        const gasPrice =
+          feeData.gasPrice ?? feeData.maxFeePerGas ?? 1_000_000_000n;
+        totalGasCost += BigInt(gasLimit) * gasPrice;
+      }
+
+      const totalNeeded = totalAmountWei(parsed) + totalGasCost;
+      if (currentBalance < totalNeeded) {
+        setError(
+          `余额不足：需 ${ethers.formatEther(totalNeeded)} ${network.nativeSymbol}（含预估 Gas），当前 ${ethers.formatEther(currentBalance)}`
+        );
+        return;
+      }
+    } catch (e) {
+      setError(`预检失败：${safeErrorMessage(e)}`);
+      return;
+    }
+
     setIsExecuting(true);
+    onExecutingChange(true);
 
     const initial: TransferResult[] = parsed.map((r) => ({
       address: r.address,
@@ -114,11 +167,13 @@ export function BatchTransfer({
       });
     } finally {
       setIsExecuting(false);
+      onExecutingChange(false);
     }
   }
 
   const successCount = results.filter((r) => r.status === "success").length;
   const failedCount = results.filter((r) => r.status === "failed").length;
+  const unknownCount = results.filter((r) => r.status === "unknown").length;
 
   return (
     <div className="space-y-6">
@@ -129,13 +184,13 @@ export function BatchTransfer({
           <input
             type="password"
             value={privateKey}
-            onChange={(e) => setPrivateKey(e.target.value)}
+            onChange={(e) => handlePrivateKeyChange(e.target.value)}
             placeholder="0x..."
             className="flex-1 px-3 py-2 rounded-md bg-gray-800 border border-gray-700 font-mono focus:outline-none focus:border-blue-500"
           />
           <button
             onClick={loadWallet}
-            disabled={isExecuting}
+            disabled={isExecuting || !rpcReady}
             className="px-4 py-2 rounded-md bg-gray-700 hover:bg-gray-600 disabled:opacity-50"
           >
             读取钱包
@@ -164,7 +219,7 @@ export function BatchTransfer({
         <h2 className="font-semibold mb-3">收款列表（地址,金额 一行一笔）</h2>
         <textarea
           value={recipientsText}
-          onChange={(e) => setRecipientsText(e.target.value)}
+          onChange={(e) => handleRecipientsChange(e.target.value)}
           rows={6}
           placeholder={"0xAAA...,0.1\n0xBBB...,0.25\n0xCCC...,0.5"}
           className="w-full px-3 py-2 rounded-md bg-gray-800 border border-gray-700 font-mono text-sm focus:outline-none focus:border-blue-500"
@@ -180,7 +235,7 @@ export function BatchTransfer({
           </button>
           <button
             onClick={start}
-            disabled={isExecuting || !wallet || !parsed}
+            disabled={isExecuting || !rpcReady || !wallet || !parsed}
             className="px-4 py-2 rounded-md bg-blue-600 hover:bg-blue-500 disabled:opacity-50 font-medium"
           >
             {isExecuting ? "执行中..." : "Start Batch Transfer"}
@@ -198,6 +253,13 @@ export function BatchTransfer({
             <div className="text-sm text-gray-400">
               成功 <span className="text-green-400">{successCount}</span> · 失败{" "}
               <span className="text-red-400">{failedCount}</span>
+              {unknownCount > 0 && (
+                <>
+                  {" "}
+                  · 待确认{" "}
+                  <span className="text-orange-400">{unknownCount}</span>
+                </>
+              )}
             </div>
           </div>
 
@@ -233,6 +295,11 @@ export function BatchTransfer({
                         <span className="text-red-400 text-xs">{r.error}</span>
                       ) : (
                         "-"
+                      )}
+                      {r.status === "unknown" && r.txHash && (
+                        <span className="block text-xs text-orange-300 mt-1">
+                          已广播但状态未确认，请先通过 txHash 检查链上结果，勿重复发送
+                        </span>
                       )}
                     </td>
                   </tr>

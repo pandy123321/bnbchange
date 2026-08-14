@@ -1,5 +1,7 @@
 import { ethers } from "ethers";
 import type { NetworkConfig } from "../config/networks";
+import type { SimpleTxStatus } from "../types";
+import { safeErrorMessage } from "../utils/error";
 import { ERC20_MIN_ABI, PANCAKE_ROUTER_V2_ABI } from "./abi";
 
 export interface TokenMetadata {
@@ -19,9 +21,10 @@ export interface BuyParams {
 }
 
 export interface BuyResult {
-  hash: string;
-  success: boolean;
+  hash?: string;
+  status: SimpleTxStatus;
   amountOutMin: bigint;
+  error?: string;
 }
 
 export function getRouter(
@@ -62,42 +65,104 @@ export async function getQuote(
 }
 
 export async function buyToken(params: BuyParams): Promise<BuyResult> {
-  const router = getRouter(params.network, params.wallet);
-  const wbnb = await router.WETH();
-  const path = [wbnb, params.tokenAddress];
+  let hash: string | undefined;
+  let amountOutMin = 0n;
 
-  const amounts = await router.getAmountsOut(params.amountInWei, path);
-  const expectedOut = BigInt(amounts[1]);
+  try {
+    const router = getRouter(params.network, params.wallet);
+    const wbnb = await router.WETH();
+    const path = [wbnb, params.tokenAddress];
 
-  const BPS = 10_000n;
-  const amountOutMin = (expectedOut * (BPS - params.slippageBps)) / BPS;
-  if (amountOutMin <= 0n) {
-    throw new Error("滑点导致最小获得量为 0，请调整滑点");
+    const amounts = await router.getAmountsOut(params.amountInWei, path);
+    const expectedOut = BigInt(amounts[1]);
+
+    const BPS = 10_000n;
+    amountOutMin = (expectedOut * (BPS - params.slippageBps)) / BPS;
+    if (amountOutMin <= 0n) {
+      throw new Error("滑点导致最小获得量为 0，请调整滑点");
+    }
+
+    const deadline = Math.floor(Date.now() / 1000) + 600;
+
+    const tx = params.supportFeeOnTransfer
+      ? await router.swapExactETHForTokensSupportingFeeOnTransferTokens(
+          amountOutMin,
+          path,
+          params.wallet.address,
+          deadline,
+          { value: params.amountInWei }
+        )
+      : await router.swapExactETHForTokens(
+          amountOutMin,
+          path,
+          params.wallet.address,
+          deadline,
+          { value: params.amountInWei }
+        );
+
+    hash = tx.hash;
+
+    const receipt = await tx.wait();
+
+    if (receipt?.status === 1) {
+      return { hash, status: "success", amountOutMin };
+    }
+
+    return {
+      hash,
+      status: "failed",
+      amountOutMin,
+      error: "Transaction reverted",
+    };
+  } catch (error) {
+    // 已广播但 receipt 无法确认 → unknown，保留 txHash
+    return {
+      hash,
+      status: hash ? "unknown" : "failed",
+      amountOutMin,
+      error: safeErrorMessage(error),
+    };
   }
+}
 
+export async function estimateBuyGasCost(
+  wallet: ethers.Wallet,
+  network: NetworkConfig,
+  tokenAddress: string,
+  amountInWei: bigint,
+  supportFeeOnTransfer: boolean
+): Promise<bigint> {
+  const router = getRouter(network, wallet);
+  const wbnb = await router.WETH();
+  const path = [wbnb, tokenAddress];
+
+  await router.getAmountsOut(amountInWei, path);
+
+  // 估算用：使用极小 amountOutMin 避免因滑点/税导致估算阶段 revert，
+  // 只需拿到真实 gas 用量；实际交易的 amountOutMin 由 buyToken 单独计算。
+  const amountOutMin = 1n;
   const deadline = Math.floor(Date.now() / 1000) + 600;
 
-  const tx = params.supportFeeOnTransfer
-    ? await router.swapExactETHForTokensSupportingFeeOnTransferTokens(
+  const gasLimit = supportFeeOnTransfer
+    ? await router.swapExactETHForTokensSupportingFeeOnTransferTokens.estimateGas(
         amountOutMin,
         path,
-        params.wallet.address,
+        wallet.address,
         deadline,
-        { value: params.amountInWei }
+        { value: amountInWei }
       )
-    : await router.swapExactETHForTokens(
+    : await router.swapExactETHForTokens.estimateGas(
         amountOutMin,
         path,
-        params.wallet.address,
+        wallet.address,
         deadline,
-        { value: params.amountInWei }
+        { value: amountInWei }
       );
 
-  const receipt = await tx.wait();
+  const provider = wallet.provider as ethers.JsonRpcProvider;
+  const feeData = await provider.getFeeData();
+  const gasPrice =
+    feeData.gasPrice ?? feeData.maxFeePerGas ?? 1_000_000_000n;
 
-  return {
-    hash: tx.hash,
-    success: receipt?.status === 1,
-    amountOutMin,
-  };
+  return BigInt(gasLimit) * gasPrice;
 }
