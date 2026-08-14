@@ -35,7 +35,9 @@ function TabButton({
 }
 
 export default function App() {
-  const [verified, setVerified] = useState(false);
+  // 仅用于本地冒烟测试的环境变量开关；默认不绕过授权门禁
+  const licenseBypass = import.meta.env.VITE_BYPASS_LICENSE === "1";
+  const [verified, setVerified] = useState(licenseBypass);
   const [networkKey, setNetworkKey] = useState<NetworkKey>("bsc-testnet");
   const [tab, setTab] = useState<Tab>("transfer");
   const [rpcError, setRpcError] = useState("");
