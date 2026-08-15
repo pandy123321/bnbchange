@@ -64,3 +64,14 @@ export interface CopyTradeResult {
   // 链上成功但到账量无法解析时的结算告警
   accountingWarning?: string;
 }
+
+// 链上 Leader 交易信号（由 monitor 解码 Router Swap 得到）
+export interface TradeSignal {
+  leaderAddress: string;
+  txHash: string;
+  direction: "buy" | "sell";
+  tokenAddress: string;
+  // 买入: 消耗的原生币数量（BNB wei）；卖出: 卖出的代币数量（wei）
+  amountInWei: bigint;
+  blockNumber: number;
+}

@@ -5,6 +5,7 @@ import type {
   CopyTradeResult,
   FollowerConfig,
   SignerWallet,
+  TradeSignal,
 } from "../types";
 import { createWallet, getWalletBalance } from "../wallet/wallet";
 import { connectMetaMask, onMetaMaskChange } from "../wallet/metamask";
@@ -14,7 +15,14 @@ import {
   sellToken,
   type TokenMetadata,
 } from "./pancake";
-import { runCopyTrade, type CopyTradeWallet } from "./copyTradeEngine";
+import {
+  runCopyTrade,
+  runFollowersBuy,
+  sellFollowersForToken,
+  type CopyTradeWallet,
+} from "./copyTradeEngine";
+import { startTradeMonitor, type TradeMonitor } from "./monitor";
+import { PANCAKE_ROUTER_V2_ABI } from "./abi";
 import {
   getPosition,
   listPositions,
@@ -25,6 +33,30 @@ import {
 import { exportCopyTradeCsv } from "../utils/csv";
 import { txExplorerUrl } from "../utils/explorer";
 import { safeErrorMessage } from "../utils/error";
+
+interface SignalLogEntry {
+  txHash: string;
+  direction: "buy" | "sell";
+  tokenSymbol: string;
+  amountText: string;
+  status: "detected" | "following" | "done" | "error";
+  summary: string;
+}
+
+function SignalStatusBadge({ status }: { status: SignalLogEntry["status"] }) {
+  const map = {
+    detected: ["bg-blue-500/15 text-blue-300", "已检测"],
+    following: ["bg-yellow-500/15 text-yellow-300", "跟单中"],
+    done: ["bg-green-500/15 text-green-300", "完成"],
+    error: ["bg-red-500/15 text-red-300", "失败"],
+  } as const;
+  const [cls, label] = map[status];
+  return (
+    <span className={`px-2 py-0.5 rounded text-xs font-medium ${cls}`}>
+      {label}
+    </span>
+  );
+}
 
 function StatusBadge({ status }: { status: CopyTradeResult["status"] }) {
   const map = {
@@ -121,8 +153,26 @@ export function CopyTrade({
   const executionRef = useRef(false);
   const metaSubRef = useRef<(() => void) | null>(null);
 
+  // 自动监听状态
+  const [monitoring, setMonitoring] = useState(false);
+  const [signalLog, setSignalLog] = useState<SignalLogEntry[]>([]);
+  const monitorRef = useRef<TradeMonitor | null>(null);
+  const autoExecRef = useRef(false);
+  // latest-value refs：监听回调跨异步读取时始终拿到最新配置，避免闭包陈旧
+  const followersRef = useRef(followers);
+  followersRef.current = followers;
+  const slippageRef = useRef(slippageText);
+  slippageRef.current = slippageText;
+  const supportFotRef = useRef(supportFeeOnTransfer);
+  supportFotRef.current = supportFeeOnTransfer;
+
   useEffect(() => {
-    return () => metaSubRef.current?.();
+    return () => {
+      metaSubRef.current?.();
+      // 组件卸载（含网络切换导致的 remount）时停止监听
+      monitorRef.current?.stop();
+      monitorRef.current = null;
+    };
   }, []);
 
   // 网络切换时重新加载当前 Chain 的持仓，避免展示上一条链的仓位
@@ -554,6 +604,269 @@ export function CopyTrade({
     }
   }
 
+  function upsertSignalLog(entry: SignalLogEntry) {
+    setSignalLog((prev) => {
+      const idx = prev.findIndex((e) => e.txHash === entry.txHash);
+      if (idx === -1) {
+        return [entry, ...prev].slice(0, 50);
+      }
+      const next = [...prev];
+      next[idx] = entry;
+      return next;
+    });
+  }
+
+  function handleSignal(signal: TradeSignal) {
+    upsertSignalLog({
+      txHash: signal.txHash,
+      direction: signal.direction,
+      tokenSymbol: "",
+      amountText: "",
+      status: "detected",
+      summary: "",
+    });
+
+    if (autoExecRef.current) {
+      upsertSignalLog({
+        txHash: signal.txHash,
+        direction: signal.direction,
+        tokenSymbol: "",
+        amountText: "",
+        status: "error",
+        summary: "上一次跟单尚未完成，已跳过本信号",
+      });
+      return;
+    }
+
+    autoExecRef.current = true;
+    void (signal.direction === "buy"
+      ? followBuy(signal)
+      : followSell(signal));
+  }
+
+  async function followBuy(signal: TradeSignal) {
+    try {
+      let meta: TokenMetadata;
+      try {
+        meta = await getTokenMetadata(signal.tokenAddress, provider);
+      } catch (e) {
+        upsertSignalLog({
+          txHash: signal.txHash,
+          direction: "buy",
+          tokenSymbol: "",
+          amountText: ethers.formatEther(signal.amountInWei),
+          status: "error",
+          summary: `代币信息读取失败，已跳过跟单：${safeErrorMessage(e)}`,
+        });
+        return;
+      }
+
+      upsertSignalLog({
+        txHash: signal.txHash,
+        direction: "buy",
+        tokenSymbol: meta.symbol,
+        amountText: ethers.formatEther(signal.amountInWei),
+        status: "following",
+        summary: `Leader 买入 ${ethers.formatEther(signal.amountInWei)} ${network.nativeSymbol}，开始跟单`,
+      });
+
+      const slippageBps = slippagePercentToBps(slippageRef.current);
+      const followerWallets: CopyTradeWallet[] = followersRef.current.map(
+        (f) => ({
+          role: "follower",
+          name: f.name,
+          wallet: createWallet(f.privateKey, provider),
+          amountWei: f.buyAmountWei,
+          amountText: f.buyAmountText,
+        })
+      );
+
+      const buyResults = await runFollowersBuy(
+        {
+          tokenAddress: signal.tokenAddress,
+          slippageBps,
+          network,
+          supportFeeOnTransfer: supportFotRef.current,
+          followers: followerWallets,
+        },
+        () => {}
+      );
+
+      // 买入成功后写持仓（仅 success 且实际到账 > 0）
+      for (const r of buyResults) {
+        if (r.role !== "follower" || r.status !== "success") continue;
+        const received = r.receivedAmountWei ?? 0n;
+        if (received <= 0n) continue;
+        const fw = followerWallets.find(
+          (f) => f.wallet.address.toLowerCase() === r.address.toLowerCase()
+        );
+        upsertPosition(
+          network.chainId,
+          r.address,
+          signal.tokenAddress,
+          meta.symbol,
+          meta.decimals,
+          received,
+          fw?.amountWei ?? 0n,
+          r.txHash
+        );
+      }
+      setPositions(listPositions(network.chainId));
+
+      const ok = buyResults.filter((r) => r.status === "success").length;
+      upsertSignalLog({
+        txHash: signal.txHash,
+        direction: "buy",
+        tokenSymbol: meta.symbol,
+        amountText: ethers.formatEther(signal.amountInWei),
+        status: "done",
+        summary: `跟单买入完成：成功 ${ok} / ${buyResults.length}`,
+      });
+    } catch (e) {
+      upsertSignalLog({
+        txHash: signal.txHash,
+        direction: "buy",
+        tokenSymbol: "",
+        amountText: "",
+        status: "error",
+        summary: safeErrorMessage(e),
+      });
+    } finally {
+      autoExecRef.current = false;
+    }
+  }
+
+  async function followSell(signal: TradeSignal) {
+    try {
+      const positions = listPositions(network.chainId);
+      const related = positions.filter(
+        (p) => p.tokenAddress.toLowerCase() === signal.tokenAddress.toLowerCase()
+      );
+      const symbol = related[0]?.tokenSymbol ?? "";
+
+      upsertSignalLog({
+        txHash: signal.txHash,
+        direction: "sell",
+        tokenSymbol: symbol,
+        amountText: "",
+        status: "following",
+        summary: "Leader 卖出，开始跟卖（全额卖出）",
+      });
+
+      const slippageBps = slippagePercentToBps(slippageRef.current);
+      const followerWallets: CopyTradeWallet[] = followersRef.current.map(
+        (f) => ({
+          role: "follower",
+          name: f.name,
+          wallet: createWallet(f.privateKey, provider),
+          amountWei: f.buyAmountWei,
+          amountText: f.buyAmountText,
+        })
+      );
+
+      const sellResults = await sellFollowersForToken(
+        {
+          chainId: network.chainId,
+          tokenAddress: signal.tokenAddress,
+          slippageBps,
+          network,
+          supportFeeOnTransfer: supportFotRef.current,
+          followers: followerWallets,
+        },
+        () => {}
+      );
+      setPositions(listPositions(network.chainId));
+
+      const ok = sellResults.filter((r) => r.status === "success").length;
+      const failed = sellResults.filter((r) => r.status === "failed").length;
+      const skipped = sellResults.filter((r) => r.status === "skipped").length;
+      const unknown = sellResults.filter((r) => r.status === "unknown").length;
+
+      const parts = [`成功 ${ok}`];
+      if (failed > 0) parts.push(`失败 ${failed}`);
+      if (skipped > 0) parts.push(`跳过 ${skipped}`);
+      if (unknown > 0) parts.push(`待确认 ${unknown}`);
+
+      upsertSignalLog({
+        txHash: signal.txHash,
+        direction: "sell",
+        tokenSymbol: symbol,
+        amountText: "",
+        status: "done",
+        summary: `跟卖完成：${parts.join("，")}`,
+      });
+    } catch (e) {
+      upsertSignalLog({
+        txHash: signal.txHash,
+        direction: "sell",
+        tokenSymbol: "",
+        amountText: "",
+        status: "error",
+        summary: safeErrorMessage(e),
+      });
+    } finally {
+      autoExecRef.current = false;
+    }
+  }
+
+  async function startMonitor() {
+    setError("");
+    setMessage("");
+
+    if (!rpcReady) {
+      setError("RPC 网络未就绪，无法开始监听");
+      return;
+    }
+    if (!leaderWallet) {
+      setError("请先连接带单钱包（输入私钥或连接小狐狸）");
+      return;
+    }
+    if (followersRef.current.length === 0) {
+      setError("请先解析跟单钱包");
+      return;
+    }
+    if (!network.routerAddress) {
+      setError("当前网络不支持跟单监听");
+      return;
+    }
+
+    try {
+      // 提前校验滑点，避免监听过程中才发现配置非法
+      slippagePercentToBps(slippageRef.current);
+
+      const router = new ethers.Contract(
+        network.routerAddress,
+        PANCAKE_ROUTER_V2_ABI,
+        provider
+      );
+      const wbnb = (await router.WETH()) as string;
+
+      const monitor = startTradeMonitor({
+        provider,
+        leaderAddress: leaderWallet.address,
+        routerAddress: network.routerAddress,
+        wbnbAddress: wbnb,
+        onSignal: handleSignal,
+        onError: (err) => setError(`监听异常：${safeErrorMessage(err)}`),
+      });
+
+      monitorRef.current = monitor;
+      setMonitoring(true);
+      setMessage(
+        `已开始监听带单地址 ${leaderWallet.address.slice(0, 10)}...（区块轮询，4 秒/次）`
+      );
+    } catch (e) {
+      setError(safeErrorMessage(e));
+    }
+  }
+
+  function stopMonitor() {
+    monitorRef.current?.stop();
+    monitorRef.current = null;
+    setMonitoring(false);
+    setMessage("已停止监听");
+  }
+
   const successCount = results.filter((r) => r.status === "success").length;
   const failedCount = results.filter((r) => r.status === "failed").length;
   const unknownCount = results.filter((r) => r.status === "unknown").length;
@@ -800,6 +1113,76 @@ export function CopyTrade({
 
         {message && <p className="mt-3 text-sm text-green-400">{message}</p>}
         {error && <p className="mt-3 text-sm text-red-400">{error}</p>}
+      </section>
+
+      <section className="rounded-xl border border-gray-800 bg-gray-900 p-5">
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="font-semibold">自动监听</h2>
+          <div className="flex items-center gap-3">
+            {monitoring && (
+              <span className="flex items-center gap-1.5 text-xs text-green-400">
+                <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse"></span>
+                监听中
+              </span>
+            )}
+            <button
+              onClick={monitoring ? stopMonitor : startMonitor}
+              disabled={!rpcReady || isExecuting}
+              className={`px-4 py-2 rounded-md font-medium disabled:opacity-50 ${
+                monitoring
+                  ? "bg-red-600 hover:bg-red-500"
+                  : "bg-green-600 hover:bg-green-500"
+              }`}
+            >
+              {monitoring ? "停止监听" : "开始监听"}
+            </button>
+          </div>
+        </div>
+        <p className="text-xs text-gray-500">
+          监听带单地址的链上买入/卖出，自动触发跟单买入与跟卖（全额卖出）。同一 txHash
+          只触发一次。
+        </p>
+
+        {signalLog.length > 0 && (
+          <div className="mt-3 overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-left text-gray-400 border-b border-gray-800">
+                  <th className="py-2 pr-4">方向</th>
+                  <th className="py-2 pr-4">代币</th>
+                  <th className="py-2 pr-4">金额</th>
+                  <th className="py-2 pr-4">状态</th>
+                  <th className="py-2">说明</th>
+                </tr>
+              </thead>
+              <tbody>
+                {signalLog.map((e) => (
+                  <tr key={e.txHash} className="border-b border-gray-800/50">
+                    <td className="py-2 pr-4">
+                      <span
+                        className={
+                          e.direction === "buy"
+                            ? "text-green-400"
+                            : "text-red-400"
+                        }
+                      >
+                        {e.direction === "buy" ? "买入" : "卖出"}
+                      </span>
+                    </td>
+                    <td className="py-2 pr-4">{e.tokenSymbol || "-"}</td>
+                    <td className="py-2 pr-4">{e.amountText || "-"}</td>
+                    <td className="py-2 pr-4">
+                      <SignalStatusBadge status={e.status} />
+                    </td>
+                    <td className="py-2 text-xs text-gray-400 break-all">
+                      {e.summary}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </section>
 
       {results.length > 0 && (
