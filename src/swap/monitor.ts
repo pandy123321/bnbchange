@@ -146,9 +146,10 @@ export function startTradeMonitor(config: TradeMonitorConfig): TradeMonitor {
 
   async function scanBlock(blockNumber: number): Promise<void> {
     const block = await config.provider.getBlock(blockNumber, true);
-    if (!block) return;
+    if (!block || stopped) return;
 
     for (const tx of block.prefetchedTransactions ?? []) {
+      if (stopped) return;
       if (seenTx.has(tx.hash)) continue;
 
       const signal = decode(tx);
@@ -156,6 +157,9 @@ export function startTradeMonitor(config: TradeMonitorConfig): TradeMonitor {
 
       // 仅对确认成功的 Leader 交易生成信号。
       const receipt = await config.provider.getTransactionReceipt(tx.hash);
+      // Stop 后晚到的 receipt 不得继续处理，更不得 emit 资金 Signal
+      if (stopped) return;
+
       if (!receipt) {
         // unresolved：不写 seenTx，不 checkpoint，抛错让本 Block 下一轮重试
         throw new Error(
@@ -170,6 +174,8 @@ export function startTradeMonitor(config: TradeMonitorConfig): TradeMonitor {
         continue;
       }
 
+      // onSignal 前最后一道防线：Stop 返回后绝不再产生新 Signal callback
+      if (stopped) return;
       try {
         config.onSignal(signal);
       } catch {
@@ -206,6 +212,7 @@ export function startTradeMonitor(config: TradeMonitorConfig): TradeMonitor {
       }
 
       for (let b = start; b <= current; b++) {
+        if (stopped) break;
         await scanBlock(b);
         // checkpoint 仅在完整成功扫描 Block b 后推进；
         // 若 b 失败，lastBlock 保持 b-1，下一轮从 b 重试（链读取重试，非资金交易重试）

@@ -697,6 +697,23 @@ export function CopyTrade({
   }
 
   function handleSignal(signal: TradeSignal) {
+    // Halt 门禁：Stop/Fail Closed 后晚到的信号绝不进入队列，标记 cancelled 供人工核对。
+    // 记录 txHash 到 accepted，确保 Restart 后也不会自动重复执行这笔旧信号。
+    if (autoHaltedRef.current) {
+      if (!acceptedSignalHashesRef.current.has(signal.txHash)) {
+        acceptedSignalHashesRef.current.set(signal.txHash, signal.blockNumber);
+      }
+      upsertSignalLog({
+        txHash: signal.txHash,
+        direction: signal.direction,
+        tokenSymbol: "",
+        amountText: "",
+        status: "cancelled",
+        summary: "信号在自动监听停止后返回，未执行，请人工核对",
+      });
+      return;
+    }
+
     // 全生命周期 exactly-once 去重（最后资金防线）：覆盖 queued + executing + completed
     if (acceptedSignalHashesRef.current.has(signal.txHash)) return;
     acceptedSignalHashesRef.current.set(signal.txHash, signal.blockNumber);
@@ -1030,6 +1047,10 @@ export function CopyTrade({
 
       monitorRef.current = monitor;
       queueLimitReachedRef.current = false;
+      // 启动前确保队列为空，避免携带上一轮 Stop 遗留的 stale signal
+      if (queueRef.current.length > 0) {
+        markPendingCancelled("重新启动监听前清理遗留信号，请人工核对");
+      }
       autoHaltedRef.current = false;
       setMonitoring(true);
       setMessage(
