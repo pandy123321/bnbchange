@@ -25,8 +25,10 @@ export interface BuyResult {
   hash?: string;
   status: SimpleTxStatus;
   amountOutMin: bigint;
-  // 报价得到的目标代币数量，用于持仓记账（含税代币为近似值）
+  // 买入前报价得到的目标代币数量（仅用于 Quote / UI，不用于持仓记账）
   expectedOut: bigint;
+  // 买入确认后实际到账数量（balance delta），持仓记账 SoT，覆盖 FOT 代币
+  receivedAmountWei: bigint;
   error?: string;
 }
 
@@ -70,10 +72,16 @@ export async function getQuote(
   return BigInt(amounts[1]);
 }
 
+async function getGasPrice(provider: ethers.Provider): Promise<bigint> {
+  const feeData = await provider.getFeeData();
+  return feeData.gasPrice ?? feeData.maxFeePerGas ?? 1_000_000_000n;
+}
+
 export async function buyToken(params: BuyParams): Promise<BuyResult> {
   let hash: string | undefined;
   let amountOutMin = 0n;
   let expectedOut = 0n;
+  let receivedAmountWei = 0n;
 
   try {
     // 广播前再次核验实际 Chain ID（Fail Closed）
@@ -82,6 +90,16 @@ export async function buyToken(params: BuyParams): Promise<BuyResult> {
     const router = getRouter(params.network, params.wallet);
     const wbnb = await router.WETH();
     const path = [wbnb, params.tokenAddress];
+
+    // 买入前余额，用于结算实际到账量（覆盖 Fee-On-Transfer 代币）
+    const token = new ethers.Contract(
+      params.tokenAddress,
+      ERC20_MIN_ABI,
+      params.wallet
+    );
+    const balanceBefore = BigInt(
+      await token.balanceOf(params.wallet.address)
+    );
 
     const amounts = await router.getAmountsOut(params.amountInWei, path);
     expectedOut = BigInt(amounts[1]);
@@ -115,7 +133,18 @@ export async function buyToken(params: BuyParams): Promise<BuyResult> {
     const receipt = await tx.wait();
 
     if (receipt?.status === 1) {
-      return { hash, status: "success", amountOutMin, expectedOut };
+      const balanceAfter = BigInt(
+        await token.balanceOf(params.wallet.address)
+      );
+      receivedAmountWei =
+        balanceAfter > balanceBefore ? balanceAfter - balanceBefore : 0n;
+      return {
+        hash,
+        status: "success",
+        amountOutMin,
+        expectedOut,
+        receivedAmountWei,
+      };
     }
 
     return {
@@ -123,6 +152,7 @@ export async function buyToken(params: BuyParams): Promise<BuyResult> {
       status: "failed",
       amountOutMin,
       expectedOut,
+      receivedAmountWei,
       error: "交易已回滚",
     };
   } catch (error) {
@@ -138,6 +168,7 @@ export async function buyToken(params: BuyParams): Promise<BuyResult> {
       status,
       amountOutMin,
       expectedOut,
+      receivedAmountWei,
       error: safeErrorMessage(error),
     };
   }
@@ -181,11 +212,7 @@ export async function estimateBuyGasCost(
   if (!provider) {
     throw new Error("钱包未连接 Provider");
   }
-  const feeData = await provider.getFeeData();
-  const gasPrice =
-    feeData.gasPrice ?? feeData.maxFeePerGas ?? 1_000_000_000n;
-
-  return BigInt(gasLimit) * gasPrice;
+  return BigInt(gasLimit) * (await getGasPrice(provider));
 }
 
 export interface SellParams {
@@ -198,14 +225,17 @@ export interface SellParams {
 }
 
 export interface SellResult {
-  hash?: string;
   status: SimpleTxStatus;
+  phase?: "approval" | "swap";
+  approvalHash?: string;
+  swapHash?: string;
   amountOutMin: bigint;
   error?: string;
 }
 
 export async function sellToken(params: SellParams): Promise<SellResult> {
-  let hash: string | undefined;
+  let approvalHash: string | undefined;
+  let swapHash: string | undefined;
   let amountOutMin = 0n;
 
   try {
@@ -216,26 +246,59 @@ export async function sellToken(params: SellParams): Promise<SellResult> {
     const wbnb = await router.WETH();
     const path = [params.tokenAddress, wbnb];
 
-    // 卖出走 swapExactTokensForETH（内部 transferFrom），需先授权 Router 划转代币
     const token = new ethers.Contract(
       params.tokenAddress,
       ERC20_MIN_ABI,
       params.wallet
     );
-    const [balance, allowance] = await Promise.all([
-      token.balanceOf(params.wallet.address),
-      token.allowance(params.wallet.address, routerAddress),
-    ]);
 
+    const balance = BigInt(await token.balanceOf(params.wallet.address));
     if (balance < params.amountInWei) {
       throw new Error("代币余额不足");
     }
 
+    // 1. Approval phase（卖出走 transferFrom，需授权 Router 划转代币）
+    const allowance = BigInt(
+      await token.allowance(params.wallet.address, routerAddress)
+    );
     if (allowance < params.amountInWei) {
+      // 授权前预检：估算 approve gas 并校验原生币余额，避免无 Gas 仍广播
+      const approveGas = await token.approve.estimateGas(
+        routerAddress,
+        params.amountInWei
+      );
+      const approveGasCost =
+        BigInt(approveGas) * (await getGasPrice(params.wallet.provider!));
+      const nativeBalance = await params.wallet.provider!.getBalance(
+        params.wallet.address
+      );
+      if (nativeBalance < approveGasCost) {
+        throw new Error(
+          `${params.network.nativeSymbol} 余额不足以支付授权 Gas`
+        );
+      }
+
       const approveTx = await token.approve(routerAddress, params.amountInWei);
-      await approveTx.wait();
+      approvalHash = approveTx.hash;
+      const approveReceipt = await approveTx.wait();
+
+      if (approveReceipt?.status !== 1) {
+        return {
+          status: "failed",
+          phase: "approval",
+          approvalHash,
+          amountOutMin,
+          error: "授权交易失败",
+        };
+      }
+      // 授权确认后再次 Fail Closed Chain ID
+      await assertExpectedChain(
+        params.wallet.provider!,
+        params.network.chainId
+      );
     }
 
+    // 2. Swap phase
     const amounts = await router.getAmountsOut(params.amountInWei, path);
     const expectedOut = BigInt(amounts[1]);
 
@@ -246,6 +309,31 @@ export async function sellToken(params: SellParams): Promise<SellResult> {
     }
 
     const deadline = Math.floor(Date.now() / 1000) + 600;
+
+    // Swap 前预检：估算 swap gas 并校验原生币余额
+    const swapGas = params.supportFeeOnTransfer
+      ? await router.swapExactTokensForETHSupportingFeeOnTransferTokens.estimateGas(
+          params.amountInWei,
+          amountOutMin,
+          path,
+          params.wallet.address,
+          deadline
+        )
+      : await router.swapExactTokensForETH.estimateGas(
+          params.amountInWei,
+          amountOutMin,
+          path,
+          params.wallet.address,
+          deadline
+        );
+    const swapGasCost =
+      BigInt(swapGas) * (await getGasPrice(params.wallet.provider!));
+    const nativeBalance = await params.wallet.provider!.getBalance(
+      params.wallet.address
+    );
+    if (nativeBalance < swapGasCost) {
+      throw new Error(`${params.network.nativeSymbol} 余额不足以支付卖出 Gas`);
+    }
 
     const tx = params.supportFeeOnTransfer
       ? await router.swapExactTokensForETHSupportingFeeOnTransferTokens(
@@ -263,74 +351,51 @@ export async function sellToken(params: SellParams): Promise<SellResult> {
           deadline
         );
 
-    hash = tx.hash;
+    swapHash = tx.hash;
 
     const receipt = await tx.wait();
 
     if (receipt?.status === 1) {
-      return { hash, status: "success", amountOutMin };
+      return {
+        status: "success",
+        phase: "swap",
+        approvalHash,
+        swapHash,
+        amountOutMin,
+      };
     }
 
     return {
-      hash,
       status: "failed",
+      phase: "swap",
+      approvalHash,
+      swapHash,
       amountOutMin,
       error: "交易已回滚",
     };
   } catch (error) {
-    const status = hash
-      ? isConfirmedRevert(error)
-        ? "failed"
-        : "unknown"
-      : "failed";
-    return {
-      hash,
-      status,
-      amountOutMin,
-      error: safeErrorMessage(error),
-    };
-  }
-}
-
-export async function estimateSellGasCost(
-  wallet: SignerWallet,
-  network: NetworkConfig,
-  tokenAddress: string,
-  amountInWei: bigint,
-  supportFeeOnTransfer: boolean
-): Promise<bigint> {
-  const router = getRouter(network, wallet);
-  const wbnb = await router.WETH();
-  const path = [tokenAddress, wbnb];
-
-  await router.getAmountsOut(amountInWei, path);
-
-  const amountOutMin = 1n;
-  const deadline = Math.floor(Date.now() / 1000) + 600;
-
-  const gasLimit = supportFeeOnTransfer
-    ? await router.swapExactTokensForETHSupportingFeeOnTransferTokens.estimateGas(
-        amountInWei,
+    // 已广播但未确认：按阶段保留 txHash，返回 unknown，禁止盲目重发
+    if (swapHash) {
+      const status = isConfirmedRevert(error) ? "failed" : "unknown";
+      return {
+        status,
+        phase: "swap",
+        approvalHash,
+        swapHash,
         amountOutMin,
-        path,
-        wallet.address,
-        deadline
-      )
-    : await router.swapExactTokensForETH.estimateGas(
-        amountInWei,
+        error: safeErrorMessage(error),
+      };
+    }
+    if (approvalHash) {
+      const status = isConfirmedRevert(error) ? "failed" : "unknown";
+      return {
+        status,
+        phase: "approval",
+        approvalHash,
         amountOutMin,
-        path,
-        wallet.address,
-        deadline
-      );
-
-  const provider = wallet.provider;
-  if (!provider) {
-    throw new Error("钱包未连接 Provider");
+        error: safeErrorMessage(error),
+      };
+    }
+    return { status: "failed", amountOutMin, error: safeErrorMessage(error) };
   }
-  const feeData = await provider.getFeeData();
-  const gasPrice =
-    feeData.gasPrice ?? feeData.maxFeePerGas ?? 1_000_000_000n;
-
-  return BigInt(gasLimit) * gasPrice;
 }

@@ -125,6 +125,11 @@ export function CopyTrade({
     return () => metaSubRef.current?.();
   }, []);
 
+  // 网络切换时重新加载当前 Chain 的持仓，避免展示上一条链的仓位
+  useEffect(() => {
+    setPositions(listPositions(network.chainId));
+  }, [network.chainId]);
+
   function handleLeaderPrivateKeyChange(value: string) {
     setLeaderPrivateKey(value);
     // 源输入变化 → 旧 leader wallet / 余额立即失效
@@ -439,16 +444,17 @@ export function CopyTrade({
           (f) => f.wallet.address.toLowerCase() === r.address.toLowerCase()
         );
         upsertPosition(
+          network.chainId,
           r.address,
           tokenMeta!.address,
           tokenMeta!.symbol,
           tokenMeta!.decimals,
-          r.expectedOutWei ?? 0n,
+          r.receivedAmountWei ?? 0n,
           fw?.amountWei ?? 0n,
           r.txHash
         );
       }
-      setPositions(listPositions());
+      setPositions(listPositions(network.chainId));
     } catch (e) {
       setError(safeErrorMessage(e));
     } finally {
@@ -459,11 +465,18 @@ export function CopyTrade({
   }
 
   function posKey(p: Position): string {
-    return `${p.follower.toLowerCase()}:${p.tokenAddress.toLowerCase()}`;
+    return `${p.chainId}:${p.follower.toLowerCase()}:${p.tokenAddress.toLowerCase()}`;
   }
 
   async function sellPosition(pos: Position, percentText: string) {
     if (executionRef.current) return;
+
+    // 跨链 Fail Closed：持仓链与当前网络不一致时禁止任何广播
+    if (pos.chainId !== network.chainId) {
+      setError("该持仓不属于当前网络，已阻止卖出");
+      setPositions(listPositions(network.chainId));
+      return;
+    }
 
     const follower = followers.find(
       (f) => f.address.toLowerCase() === pos.follower.toLowerCase()
@@ -486,10 +499,10 @@ export function CopyTrade({
     }
 
     // 无持仓 / 超卖拦截
-    const current = getPosition(pos.follower, pos.tokenAddress);
+    const current = getPosition(network.chainId, pos.follower, pos.tokenAddress);
     if (!current || current.amountWei < sellWei) {
       setError("持仓不足，已取消卖出");
-      setPositions(listPositions());
+      setPositions(listPositions(network.chainId));
       return;
     }
 
@@ -512,13 +525,17 @@ export function CopyTrade({
       });
 
       if (res.status === "success") {
-        reducePosition(pos.follower, pos.tokenAddress, sellWei);
-        setPositions(listPositions());
-        setMessage(`已卖出 ${pos.tokenSymbol}${res.hash ? " · " + res.hash.slice(0, 10) + "..." : ""}`);
+        reducePosition(network.chainId, pos.follower, pos.tokenAddress, sellWei);
+        setPositions(listPositions(network.chainId));
+        setMessage(
+          `已卖出 ${pos.tokenSymbol}${res.swapHash ? " · " + res.swapHash.slice(0, 10) + "..." : ""}`
+        );
       } else if (res.status === "unknown") {
         // 已广播但未确认：保留 txHash，不扣减持仓，提醒人工核对，避免重复卖出
+        const hash = res.swapHash ?? res.approvalHash ?? "";
+        const phase = res.phase === "approval" ? "授权" : "卖出";
         setError(
-          `卖出已广播但状态未确认（${res.hash}），请先通过链上检查结果，勿重复卖出`
+          `${phase}已广播但状态未确认（${hash}），请先通过链上检查结果，勿重复操作`
         );
       } else {
         setError(res.error ?? "卖出失败");

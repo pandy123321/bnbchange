@@ -1,7 +1,8 @@
 // 持仓账本：前端内存缓存（后台持久化见 TASK-20260815-003 持仓管理）
-// 以「跟单钱包地址 + 代币地址」为键，记录买入数量与 BNB 成本，支撑手动卖出。
+// 以「chainId + 跟单钱包地址 + 代币地址」为键，跨链完全隔离，防止串链卖出。
 
 export interface Position {
+  chainId: number;
   follower: string;
   tokenAddress: string;
   tokenSymbol: string;
@@ -14,11 +15,16 @@ export interface Position {
 
 const store = new Map<string, Position>();
 
-function key(follower: string, tokenAddress: string): string {
-  return `${follower.toLowerCase()}:${tokenAddress.toLowerCase()}`;
+function key(
+  chainId: number,
+  follower: string,
+  tokenAddress: string
+): string {
+  return `${chainId}:${follower.toLowerCase()}:${tokenAddress.toLowerCase()}`;
 }
 
 function buildPosition(
+  chainId: number,
   follower: string,
   tokenAddress: string,
   tokenSymbol: string,
@@ -28,6 +34,7 @@ function buildPosition(
   buyTxHash?: string
 ): Position {
   return {
+    chainId,
     follower,
     tokenAddress,
     tokenSymbol,
@@ -39,8 +46,9 @@ function buildPosition(
   };
 }
 
-// 买入后累计仓位；同地址同代币重复买入会合并并按加权均价重算成本。
+// 买入后累计仓位；同链同地址同代币重复买入会合并并按加权均价重算成本。
 export function upsertPosition(
+  chainId: number,
   follower: string,
   tokenAddress: string,
   tokenSymbol: string,
@@ -49,10 +57,11 @@ export function upsertPosition(
   costBnbWei: bigint,
   buyTxHash?: string
 ): Position {
-  const k = key(follower, tokenAddress);
+  const k = key(chainId, follower, tokenAddress);
   const existing = store.get(k);
   if (!existing) {
     const pos = buildPosition(
+      chainId,
       follower,
       tokenAddress,
       tokenSymbol,
@@ -68,6 +77,7 @@ export function upsertPosition(
   const amountWei = existing.amountWei + buyAmountWei;
   const totalCost = existing.costBnbWei + costBnbWei;
   const pos = buildPosition(
+    chainId,
     follower,
     tokenAddress,
     tokenSymbol,
@@ -82,11 +92,12 @@ export function upsertPosition(
 
 // 卖出后扣减仓位；全部卖出返回 null 并移除记录，部分卖出按均价等比扣减成本。
 export function reducePosition(
+  chainId: number,
   follower: string,
   tokenAddress: string,
   sellWei: bigint
 ): Position | null {
-  const k = key(follower, tokenAddress);
+  const k = key(chainId, follower, tokenAddress);
   const existing = store.get(k);
   if (!existing || existing.amountWei < sellWei) return null;
 
@@ -97,6 +108,7 @@ export function reducePosition(
   }
 
   const pos = buildPosition(
+    existing.chainId,
     existing.follower,
     existing.tokenAddress,
     existing.tokenSymbol,
@@ -110,12 +122,13 @@ export function reducePosition(
 }
 
 export function getPosition(
+  chainId: number,
   follower: string,
   tokenAddress: string
 ): Position | null {
-  return store.get(key(follower, tokenAddress)) ?? null;
+  return store.get(key(chainId, follower, tokenAddress)) ?? null;
 }
 
-export function listPositions(): Position[] {
-  return [...store.values()];
+export function listPositions(chainId: number): Position[] {
+  return [...store.values()].filter((p) => p.chainId === chainId);
 }
