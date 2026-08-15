@@ -11,6 +11,8 @@ import {
   getSession,
   roleAllows,
   loadUsers,
+  hashPassword,
+  verifyPassword,
 } from "../admin-server/auth";
 import {
   generateLicenses,
@@ -25,7 +27,9 @@ import {
   reducePosition,
   listPositions,
 } from "../admin-server/positionStore";
-import { createKey, listKeys } from "../admin-server/keyStore";
+import { createKey, listKeys, updateKey, getKey, revealKey } from "../admin-server/keyStore";
+import { decodeMasterKey, encrypt, decrypt } from "../admin-server/crypto";
+import { deriveAddressFromPrivateKey } from "../admin-server/validation";
 
 const FOLLOWER = "0x3333333333333333333333333333333333333333";
 const TOKEN = "0x55d398326f99059fF775485246999027B3197955";
@@ -185,5 +189,101 @@ describe("keyStore.js 私钥托管（P1-6）", () => {
 
   it("非法 walletType 被拒绝", () => {
     expect(() => createKey({ walletType: "hacker", privateKey: pk })).toThrow();
+  });
+});
+
+describe("keyStore.js key/address 强一致（P1-1）", () => {
+  it("updateKey 仅改 address 被拒绝且记录不变", () => {
+    const w = ethers.Wallet.createRandom();
+    const rec = createKey({ walletType: "follower", privateKey: w.privateKey });
+    const other = ethers.Wallet.createRandom();
+    expect(() => updateKey(rec.id, { address: other.address })).toThrow();
+    const after = getKey(rec.id)!;
+    expect(after.address.toLowerCase()).toBe(w.address.toLowerCase());
+  });
+
+  it("updateKey 更新 privateKey 自动派生新地址", () => {
+    const w1 = ethers.Wallet.createRandom();
+    const rec = createKey({ walletType: "follower", privateKey: w1.privateKey });
+    const w2 = ethers.Wallet.createRandom();
+    const updated = updateKey(rec.id, { privateKey: w2.privateKey });
+    expect(updated.address.toLowerCase()).toBe(w2.address.toLowerCase());
+    expect(revealKey(rec.id)).toBe(w2.privateKey);
+  });
+
+  it("updateKey 同时提交 address 与 privateKey 不一致被拒绝", () => {
+    const w1 = ethers.Wallet.createRandom();
+    const rec = createKey({ walletType: "follower", privateKey: w1.privateKey });
+    const w2 = ethers.Wallet.createRandom();
+    const w3 = ethers.Wallet.createRandom();
+    expect(() =>
+      updateKey(rec.id, { privateKey: w2.privateKey, address: w3.address })
+    ).toThrow();
+  });
+
+  it("解密后派生地址恒等于存储地址（invariant）", () => {
+    const w = ethers.Wallet.createRandom();
+    const rec = createKey({ walletType: "follower", privateKey: w.privateKey });
+    const revealed = revealKey(rec.id);
+    expect(deriveAddressFromPrivateKey(revealed).toLowerCase()).toBe(
+      rec.address.toLowerCase()
+    );
+  });
+});
+
+describe("crypto.js MASTER_KEY 强度（P1-2）", () => {
+  it("64 位 hex 解析为 32 字节", () => {
+    expect(decodeMasterKey("01".repeat(32)).length).toBe(32);
+  });
+
+  it("32 字节 base64 解析成功", () => {
+    const b64 = Buffer.from("x".repeat(32)).toString("base64");
+    expect(decodeMasterKey(b64).length).toBe(32);
+  });
+
+  it("低熵口令被拒绝", () => {
+    expect(() => decodeMasterKey("mycompany2026")).toThrow();
+    expect(() => decodeMasterKey("")).toThrow();
+  });
+
+  it("31 / 33 字节 hex 被拒绝", () => {
+    expect(() => decodeMasterKey("01".repeat(31))).toThrow();
+    expect(() => decodeMasterKey("01".repeat(33))).toThrow();
+  });
+
+  it("AES-GCM 加解密往返成功且随机 IV", () => {
+    const a = encrypt("secret-payload");
+    const b = encrypt("secret-payload");
+    expect(decrypt(a)).toBe("secret-payload");
+    expect(a.iv).not.toBe(b.iv);
+    expect(a.data).not.toBe(b.data);
+  });
+
+  it("篡改密文 / IV 解密失败（GCM auth）", () => {
+    const ct = encrypt("secret-payload");
+    const badData = Buffer.from(ct.data, "base64");
+    badData[0] ^= 0xff;
+    expect(() => decrypt({ iv: ct.iv, data: badData.toString("base64") })).toThrow();
+
+    const badIv = Buffer.from(ct.iv, "base64");
+    badIv[0] ^= 0xff;
+    expect(() => decrypt({ iv: badIv.toString("base64"), data: ct.data })).toThrow();
+  });
+});
+
+describe("auth.js verifyPassword malformed hash（P2-1）", () => {
+  it("正确密码通过、错误密码拒绝", () => {
+    const hash = hashPassword("secret123");
+    expect(verifyPassword("secret123", hash)).toBe(true);
+    expect(verifyPassword("wrong", hash)).toBe(false);
+  });
+
+  it("malformed hash 安全返回 false 而非抛异常", () => {
+    expect(verifyPassword("x", "00:00")).toBe(false);
+    expect(verifyPassword("x", "not-a-hash")).toBe(false);
+    expect(verifyPassword("x", "zz:yy")).toBe(false);
+    expect(verifyPassword("x", "a:b:c")).toBe(false);
+    expect(verifyPassword("x", "")).toBe(false);
+    expect(verifyPassword("x", "deadbeef:0123456789abcdef")).toBe(false);
   });
 });

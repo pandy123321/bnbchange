@@ -23,12 +23,27 @@ export function hashPassword(password) {
 }
 
 export function verifyPassword(password, stored) {
-  const parts = String(stored ?? "").split(":");
-  if (parts.length !== 2) return false;
-  const salt = Buffer.from(parts[0], "hex");
-  const hash = Buffer.from(parts[1], "hex");
-  const test = scryptSync(String(password), salt, 64);
-  return timingSafeEqual(test, hash);
+  try {
+    const parts = String(stored ?? "").split(":");
+    if (parts.length !== 2) return false;
+    // 严格校验格式：salt 非空合法 hex、hash 恰好 64 字节，
+    // 避免 malformed hash 触发 timingSafeEqual 长度不匹配抛异常（500）。
+    const salt = Buffer.from(parts[0], "hex");
+    const hash = Buffer.from(parts[1], "hex");
+    if (
+      !/^[0-9a-fA-F]+$/.test(parts[0]) ||
+      !/^[0-9a-fA-F]+$/.test(parts[1]) ||
+      salt.length === 0 ||
+      hash.length !== 64
+    ) {
+      return false;
+    }
+    const test = scryptSync(String(password), salt, 64);
+    return timingSafeEqual(test, hash);
+  } catch {
+    // 损坏/异常 hash → 安全失败，绝不抛 500
+    return false;
+  }
 }
 
 export function loadUsers() {

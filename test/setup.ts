@@ -6,4 +6,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 process.env.ADMIN_DATA_DIR = mkdtempSync(join(tmpdir(), "bnbchange-admin-"));
-process.env.MASTER_KEY = "test-only-master-key";
+// 32 字节测试主密钥（64 位 hex，符合 crypto.js 的严格 32 字节要求）
+process.env.MASTER_KEY =
+  "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";

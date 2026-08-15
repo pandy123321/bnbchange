@@ -77,12 +77,20 @@ export function updateKey(id, patch) {
     rec.walletType = patch.walletType;
   }
   if (patch.name != null) rec.name = patch.name;
-  if (patch.address != null) rec.address = normalizeAddress(patch.address, "address");
+
+  // address 永远是 privateKey 的派生属性，禁止独立修改，
+  // 否则 UI 显示的地址会与实际加密私钥永久不一致，破坏资金安全。
+  if (patch.address != null && patch.privateKey == null) {
+    throw new Error("address 不能独立修改，请通过更新 privateKey 自动派生地址");
+  }
   if (patch.privateKey != null) {
     const pk = String(patch.privateKey).trim();
     const derived = deriveAddressFromPrivateKey(pk);
-    // 同时提交新地址时，必须与新私钥派生地址一致
-    if (patch.address != null && patch.address.toLowerCase() !== derived.toLowerCase()) {
+    // 同时提交 address 时仅用于一致性校验，最终仍以 derived 为 SoT
+    if (
+      patch.address != null &&
+      normalizeAddress(patch.address, "address").toLowerCase() !== derived.toLowerCase()
+    ) {
       throw new Error("address 与私钥不匹配");
     }
     rec.address = derived;

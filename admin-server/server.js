@@ -328,6 +328,8 @@ const server = http.createServer((req, res) => {
         // 二次鉴权：重新输入密码
         const u = findUser(user.username);
         if (!u || !verifyPassword(body.password, u.passwordHash)) {
+          // 失败/拒绝也留审计，且不得包含私钥明文或密文
+          addLog({ operator: user.username, action: "view_private_key_denied", detail: "查看私钥明文二次鉴权失败", ip });
           return { status: 403, body: { ok: false, error: "二次鉴权失败" } };
         }
         const rec = getKeyById(body.id);

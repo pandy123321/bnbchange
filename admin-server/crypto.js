@@ -3,7 +3,6 @@
 import {
   createCipheriv,
   createDecipheriv,
-  createHash,
   randomBytes,
 } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
@@ -16,6 +15,8 @@ let cachedKey = null;
 
 // 主密钥来源优先级：MASTER_KEY 环境变量 > MASTER_KEY_FILE 文件 > 默认 master.key 文件。
 // 缺失时 Fail Closed：任何加解密都抛错，绝不使用空/固定密钥。
+// MASTER_KEY 必须是 32 字节随机密钥（64 位 hex 或 base64），拒绝低熵口令：
+// 若允许人类口令经单次 SHA-256 派生密钥，攻击者拿到 keys.json 后可离线爆破并解密全部托管私钥。
 function loadMasterKey() {
   let raw = process.env.MASTER_KEY;
   if (!raw && process.env.MASTER_KEY_FILE) {
@@ -30,8 +31,22 @@ function loadMasterKey() {
   if (!raw) {
     throw new Error("缺少主密钥：请设置 MASTER_KEY 环境变量或 master.key 文件");
   }
-  // 任意长度口令统一 sha256 派生为 32 字节 AES-256 密钥
-  return createHash("sha256").update(raw, "utf8").digest();
+  return decodeMasterKey(raw);
+}
+
+// 严格解析 32 字节密钥：优先 64 位 hex，其次 base64；任何其它输入（含低熵口令）均 Fail Closed
+export function decodeMasterKey(raw) {
+  const s = String(raw).trim();
+  if (/^[0-9a-fA-F]{64}$/.test(s)) {
+    return Buffer.from(s, "hex");
+  }
+  const fromBase64 = Buffer.from(s, "base64");
+  if (fromBase64.length === 32) {
+    return fromBase64;
+  }
+  throw new Error(
+    "MASTER_KEY 必须是 32 字节随机密钥（64 位 hex 或 base64），不接受低熵口令"
+  );
 }
 
 function getKey() {
