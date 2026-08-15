@@ -260,9 +260,11 @@ export interface SellResult {
   error?: string;
 }
 
-// 卖出 Swap 在 allowance 不足导致预检 revert 时使用的保守 Gas 预算上限。
-// 仅是资金预算，不代表 Swap 业务一定可执行；Testnet 需按典型 FOT 代币实测校准。
-const SELL_SWAP_GAS_FALLBACK_LIMIT = 1_500_000n;
+// 卖出 Swap 在授权前无法可靠预估时的保守 Gas 预算上限（heuristic）。
+// 仅用于授权前的资金预算，不代表 Swap 业务一定可执行，也不作为实际 Gas 上限；
+// 授权确认后仍会重新执行真实 estimateGas + 余额校验，不足则 Fail Closed。
+// Testnet 需按典型 FOT / 复杂代币实测校准。
+const SELL_SWAP_GAS_BUDGET_HEURISTIC = 1_500_000n;
 
 export async function sellToken(params: SellParams): Promise<SellResult> {
   let approvalHash: string | undefined;
@@ -307,8 +309,11 @@ export async function sellToken(params: SellParams): Promise<SellResult> {
       approvalGasCost = BigInt(approveGas) * gasPrice;
     }
 
-    // swap gas：allowance 不足时 estimateGas 会 revert，回退到保守预算上限；
-    // 若 allowance 已充足仍 revert，说明 Swap 业务本身不可执行，必须 Fail Closed。
+    // swap gas 预检：此处仅用于“授权前”的资金预算。
+    // allowance 已充足时 estimateGas 仍 revert → Swap 业务本身不可执行，Fail Closed。
+    // needsApproval=true 时 revert 原因无法可靠区分（可能是 allowance，也可能是
+    // 禁止卖出/黑名单/业务 revert），因此只能退化为保守预算 heuristic，
+    // 不得据此断言 Swap 一定可执行；授权确认后仍会重新真实预检。
     let swapGasCost: bigint;
     try {
       const swapGas = params.supportFeeOnTransfer
@@ -329,11 +334,11 @@ export async function sellToken(params: SellParams): Promise<SellResult> {
       swapGasCost = BigInt(swapGas) * gasPrice;
     } catch (error) {
       if (!needsApproval) {
-        // allowance 已充足仍 revert → 非 allowance 前置条件问题，禁止继续授权
+        // allowance 已充足仍 revert → 业务本身不可执行，禁止进入授权
         throw error;
       }
-      // allowance 不足导致的预检 revert：仅作资金预算，不代表 Swap 一定可执行
-      swapGasCost = SELL_SWAP_GAS_FALLBACK_LIMIT * gasPrice;
+      // 授权前的保守资金预算 heuristic（不代表 Swap 一定可执行）
+      swapGasCost = SELL_SWAP_GAS_BUDGET_HEURISTIC * gasPrice;
     }
 
     const nativeBalance0 = await params.wallet.provider!.getBalance(
