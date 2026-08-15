@@ -8,6 +8,32 @@ const RATE_LIMIT = Number(process.env.LICENSE_RATE_LIMIT ?? 10);
 const RATE_WINDOW_MS = 60_000;
 // 桌面端验证授权码后，向浏览器发放的一次性 session token 有效期
 const SESSION_TTL_MS = 10 * 60 * 1000;
+// POST JSON 请求体上限（字节），超出返回 413
+const MAX_BODY_BYTES = 8 * 1024;
+// CORS 白名单（逗号分隔）。默认仅允许本地 dev / Electron 静态服务器；
+// 公网部署时必须显式配置 LICENSE_ALLOWED_ORIGINS，禁止回退为 "*"。
+const ALLOWED_ORIGINS = (
+  process.env.LICENSE_ALLOWED_ORIGINS ??
+  "http://127.0.0.1:4173,http://127.0.0.1:5173"
+)
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+// 计算 CORS 响应头：
+// - 无 Origin（Electron 主进程 / 服务端请求）→ 空对象，不返回 CORS 头
+// - Origin 在白名单 → 返回该具体 Origin + Vary: Origin
+// - Origin 非空且不在白名单 → null（调用方应返回 403）
+function corsHeaders(origin) {
+  if (!origin) return {};
+  if (ALLOWED_ORIGINS.includes(origin)) {
+    return {
+      "Access-Control-Allow-Origin": origin,
+      Vary: "Origin",
+    };
+  }
+  return null;
+}
 
 function verify(code) {
   const normalized = normalizeCode(String(code ?? ""));
@@ -68,23 +94,37 @@ function isRateLimited(ip) {
   return false;
 }
 
-function sendJson(res, status, body) {
+function sendJson(res, status, body, extraHeaders = {}) {
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
-    "Access-Control-Allow-Origin": "*",
+    ...extraHeaders,
   });
   res.end(JSON.stringify(body));
 }
 
 const server = http.createServer((req, res) => {
+  const origin = req.headers.origin;
+
   // CORS 预检（前端 dev 从 5173 访问 8788）
   if (req.method === "OPTIONS") {
+    const cors = corsHeaders(origin);
+    if (cors === null) {
+      sendJson(res, 403, { ok: false, error: "Origin 不被允许" });
+      return;
+    }
     res.writeHead(204, {
-      "Access-Control-Allow-Origin": "*",
+      ...cors,
       "Access-Control-Allow-Methods": "POST, OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type",
     });
     res.end();
+    return;
+  }
+
+  // 浏览器跨域请求且 Origin 不在白名单 → 直接拒绝，不处理请求体
+  const cors = corsHeaders(origin);
+  if (cors === null) {
+    sendJson(res, 403, { ok: false, error: "Origin 不被允许" });
     return;
   }
 
@@ -100,32 +140,46 @@ const server = http.createServer((req, res) => {
   if (req.method === "POST" && handler) {
     const ip = req.socket.remoteAddress ?? "unknown";
     if (isRateLimited(ip)) {
-      sendJson(res, 429, { ok: false, error: "请求过于频繁，请稍后再试" });
+      sendJson(res, 429, { ok: false, error: "请求过于频繁，请稍后再试" }, cors);
       return;
     }
 
     let raw = "";
-    req.on("data", (chunk) => (raw += chunk));
+    let size = 0;
+    let tooLarge = false;
+    req.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        tooLarge = true;
+        return; // 停止累计，避免超大请求占用内存
+      }
+      raw += chunk;
+    });
     req.on("end", () => {
+      if (tooLarge) {
+        sendJson(res, 413, { ok: false, error: "请求体过大" }, cors);
+        return;
+      }
+
       let parsed;
       try {
         parsed = JSON.parse(raw || "{}");
       } catch {
-        sendJson(res, 400, { ok: false, error: "请求格式错误" });
+        sendJson(res, 400, { ok: false, error: "请求格式错误" }, cors);
         return;
       }
 
       try {
         const result = handler(parsed);
-        sendJson(res, result.ok ? 200 : 403, result);
+        sendJson(res, result.ok ? 200 : 403, result, cors);
       } catch {
-        sendJson(res, 500, { ok: false, error: "服务器内部错误" });
+        sendJson(res, 500, { ok: false, error: "服务器内部错误" }, cors);
       }
     });
     return;
   }
 
-  sendJson(res, 404, { ok: false, error: "Not Found" });
+  sendJson(res, 404, { ok: false, error: "Not Found" }, cors);
 });
 
 server.listen(PORT, HOST, () => {

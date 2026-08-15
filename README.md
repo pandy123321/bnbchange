@@ -53,8 +53,10 @@ npm run electron
 
 ```bash
 cd license-server
-node server.js   # 默认监听 0.0.0.0:8788（如需改端口/监听地址，用 LICENSE_PORT / LICENSE_HOST 环境变量）
+node server.js   # 默认监听 127.0.0.1:8788（如需改端口/监听地址，用 LICENSE_PORT / LICENSE_HOST 环境变量）
 ```
+
+> 公网部署：Node 进程默认只监听 `127.0.0.1`，不直接裸露公网。请用 Nginx / Caddy / 负载均衡提供 HTTPS，再反向代理到 `127.0.0.1:8788`。同时通过 `LICENSE_ALLOWED_ORIGINS` 显式配置允许的前端 Origin（逗号分隔），禁止使用 `*`。确需 Node 直接监听公网时再显式设置 `LICENSE_HOST=0.0.0.0`，并自行配置防火墙 / HTTPS / CORS 等边界。
 
 3. 生成 / 管理授权码（在服务器上）：
 
@@ -102,6 +104,7 @@ VITE_LICENSE_API_BASE_URL=https://你的服务器域名或IP
 |---|---|---|
 | `VITE_LICENSE_API_BASE_URL` | 前端（浏览器页面）连接的授权后端地址 | `http://127.0.0.1:8788` |
 | `LICENSE_SERVER_URL` | 桌面端（Electron 主进程）连接的授权后端地址 | `http://127.0.0.1:8788` |
+| `LICENSE_ALLOWED_ORIGINS` | 授权后端 CORS 白名单（逗号分隔，禁止 `*`） | `http://127.0.0.1:4173,http://127.0.0.1:5173` |
 | `APP_PORT` | 桌面端本地静态服务器端口 | `4173` |
 | `VITE_BSC_MAINNET_RPC_URL` | BSC 主网首选 RPC | `https://bsc-dataseed.bnbchain.org` |
 | `VITE_BSC_TESTNET_RPC_URL` | BSC 测试网首选 RPC | `https://bsc-testnet-dataseed.bnbchain.org` |

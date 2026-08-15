@@ -63,7 +63,8 @@ function TabButton({
 
 export default function App() {
   // 仅用于本地冒烟测试的环境变量开关；默认不绕过授权门禁。
-  // 强制绑定开发环境：生产构建（npm run build / dist）下 DEV 恒为 false，无法绕过授权。
+  // 强制绑定开发环境：生产构建（npm run build / dist）下 import.meta.env.DEV 恒为 false，
+  // 因此即使误设 VITE_BYPASS_LICENSE=1，也无法绕过授权（Fail Closed）。
   const licenseBypass =
     import.meta.env.DEV && import.meta.env.VITE_BYPASS_LICENSE === "1";
   const [verified, setVerified] = useState(licenseBypass || readStoredLicense());
