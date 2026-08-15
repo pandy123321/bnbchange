@@ -1,0 +1,451 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>后台管理 · 一键转账跟单</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; background: #030712; color: #e5e7eb; }
+    a { color: #60a5fa; }
+    button { cursor: pointer; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .wrap { max-width: 1080px; margin: 0 auto; padding: 24px 16px; }
+    .card { background: #111827; border: 1px solid #1f2937; border-radius: 12px; padding: 20px; margin-bottom: 16px; }
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    h2 { font-size: 16px; margin: 0 0 12px; }
+    .sub { color: #6b7280; font-size: 12px; margin-bottom: 16px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+    label { font-size: 12px; color: #9ca3af; }
+    input, select { background: #1f2937; border: 1px solid #374151; border-radius: 8px; color: #e5e7eb; padding: 8px 10px; font-size: 14px; }
+    input:focus, select:focus { outline: none; border-color: #3b82f6; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #1f2937; vertical-align: top; }
+    th { color: #9ca3af; font-weight: 500; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; word-break: break-all; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 11px; }
+    .badge.super { background: #7c3aed22; color: #c4b5fd; }
+    .badge.admin { background: #1d4ed822; color: #93c5fd; }
+    .badge.operator { background: #04785722; color: #6ee7b7; }
+    .badge.leader { background: #2563eb22; color: #93c5fd; }
+    .badge.follower { background: #05966922; color: #6ee7b7; }
+    .badge.master { background: #dc262622; color: #fca5a5; }
+    .btn { background: #374151; border: none; border-radius: 8px; color: #e5e7eb; padding: 8px 14px; font-size: 13px; }
+    .btn:hover:not(:disabled) { background: #4b5563; }
+    .btn.primary { background: #2563eb; }
+    .btn.primary:hover:not(:disabled) { background: #1d4ed8; }
+    .btn.danger { background: #dc2626; }
+    .btn.danger:hover:not(:disabled) { background: #b91c1c; }
+    .btn.sm { padding: 4px 10px; font-size: 12px; }
+    .tabs { display: flex; gap: 4px; border-bottom: 1px solid #1f2937; margin-bottom: 16px; overflow-x: auto; }
+    .tabs button { background: transparent; border: none; color: #9ca3af; padding: 10px 14px; font-size: 14px; border-bottom: 2px solid transparent; }
+    .tabs button.active { color: #e5e7eb; border-bottom-color: #2563eb; }
+    .msg { font-size: 13px; margin: 8px 0; }
+    .msg.ok { color: #34d399; }
+    .msg.err { color: #f87171; }
+    .secret { background: #000; color: #fbbf24; font-family: monospace; padding: 8px; border-radius: 6px; word-break: break-all; }
+    .hidden { display: none; }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    @media (max-width: 640px) { .grid2 { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div id="loginView" class="card" style="max-width: 380px; margin: 60px auto;">
+      <h1>后台管理</h1>
+      <p class="sub">一键转账跟单 · 私钥托管 / 日志 / 持仓 / 授权</p>
+      <div class="field">
+        <label>用户名</label>
+        <input id="loginUser" autocomplete="username" />
+      </div>
+      <div class="field">
+        <label>密码</label>
+        <input id="loginPass" type="password" autocomplete="current-password" />
+      </div>
+      <div id="loginMsg" class="msg err hidden"></div>
+      <button class="btn primary" style="width:100%" onclick="login()">登录</button>
+    </div>
+
+    <div id="appView" class="hidden">
+      <div class="row" style="justify-content: space-between; margin-bottom: 12px;">
+        <div>
+          <h1>后台管理</h1>
+          <div class="sub">当前用户：<span id="who" class="mono"></span> <span id="roleBadge"></span></div>
+        </div>
+        <button class="btn" onclick="logout()">退出</button>
+      </div>
+
+      <div class="tabs">
+        <button data-tab="keys" class="active" onclick="switchTab('keys')">私钥托管</button>
+        <button data-tab="logs" onclick="switchTab('logs')">操作日志</button>
+        <button data-tab="positions" onclick="switchTab('positions')">持仓</button>
+        <button data-tab="licenses" onclick="switchTab('licenses')">授权码</button>
+        <button data-tab="users" onclick="switchTab('users')">用户</button>
+      </div>
+
+      <!-- 私钥托管 -->
+      <div id="tab-keys" class="card">
+        <h2>私钥托管</h2>
+        <div class="card" style="background:#0b1220;">
+          <div class="grid2">
+            <div class="field"><label>钱包类型</label>
+              <select id="keyType"><option value="leader">Leader</option><option value="follower">Follower</option><option value="master">Master(主账号)</option></select>
+            </div>
+            <div class="field"><label>名称(可选)</label><input id="keyName" /></div>
+            <div class="field"><label>地址(可选)</label><input id="keyAddress" class="mono" /></div>
+            <div class="field"><label>私钥</label><input id="keyPrivate" type="password" class="mono" placeholder="0x..." /></div>
+          </div>
+          <button class="btn primary" onclick="createKey()">新增私钥</button>
+        </div>
+        <div id="keyMsg" class="msg hidden"></div>
+        <div id="keyList"></div>
+      </div>
+
+      <!-- 操作日志 -->
+      <div id="tab-logs" class="card hidden">
+        <h2>操作日志</h2>
+        <div id="logList"></div>
+      </div>
+
+      <!-- 持仓 -->
+      <div id="tab-positions" class="card hidden">
+        <h2>持仓管理</h2>
+        <div id="posList"></div>
+      </div>
+
+      <!-- 授权码 -->
+      <div id="tab-licenses" class="card hidden">
+        <h2>授权码</h2>
+        <div class="row" style="margin-bottom:12px;">
+          <div class="field"><label>数量</label><input id="licCount" type="number" value="1" style="width:80px" /></div>
+          <div class="field"><label>有效期(天，0=永久)</label><input id="licDays" type="number" value="30" style="width:100px" /></div>
+          <div class="field"><label>备注</label><input id="licNote" /></div>
+          <button class="btn primary" onclick="generateLicenses()">生成</button>
+        </div>
+        <div id="licMsg" class="msg hidden"></div>
+        <div id="licList"></div>
+      </div>
+
+      <!-- 用户 -->
+      <div id="tab-users" class="card hidden">
+        <h2>用户管理</h2>
+        <div class="row" style="margin-bottom:12px;">
+          <div class="field"><label>用户名</label><input id="userName" /></div>
+          <div class="field"><label>密码</label><input id="userPass" type="password" /></div>
+          <div class="field"><label>角色</label>
+            <select id="userRole"><option value="operator">operator</option><option value="admin">admin</option><option value="super">super</option></select>
+          </div>
+          <button class="btn primary" onclick="createUser()">新增用户</button>
+        </div>
+        <div id="userMsg" class="msg hidden"></div>
+        <div id="userList"></div>
+      </div>
+    </div>
+
+    <!-- 私钥明文查看弹窗 -->
+    <div id="revealModal" class="hidden" style="position:fixed; inset:0; background:rgba(0,0,0,.7); display:none; align-items:center; justify-content:center; z-index:50;">
+      <div class="card" style="max-width:520px; width:100%;">
+        <h2>查看私钥明文（二次鉴权）</h2>
+        <p class="sub">查看私钥明文为高风险操作，将被记录到审计日志。</p>
+        <div class="field"><label>请再次输入你的登录密码</label><input id="revealPass" type="password" /></div>
+        <div id="revealMsg" class="msg hidden"></div>
+        <div id="revealResult"></div>
+        <div class="row" style="justify-content:flex-end; margin-top:12px;">
+          <button class="btn" onclick="closeReveal()">关闭</button>
+          <button class="btn danger" onclick="doReveal()">确认查看</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+let TOKEN = localStorage.getItem("admin_token") || "";
+let ROLE = "";
+let USER = "";
+let currentRevealId = null;
+
+async function api(path, body) {
+  const headers = { "Content-Type": "application/json" };
+  if (TOKEN) headers["Authorization"] = "Bearer " + TOKEN;
+  const res = await fetch(path, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body || {}),
+  });
+  let data;
+  try { data = await res.json(); } catch { data = {}; }
+  return { status: res.status, data };
+}
+
+function showMsg(el, text, ok) {
+  el.textContent = text;
+  el.className = "msg " + (ok ? "ok" : "err");
+  el.classList.remove("hidden");
+}
+
+async function login() {
+  const u = document.getElementById("loginUser").value.trim();
+  const p = document.getElementById("loginPass").value;
+  if (!u || !p) { showMsg(document.getElementById("loginMsg"), "请输入用户名和密码", false); return; }
+  const r = await api("/api/admin/login", { username: u, password: p });
+  if (r.data.ok) {
+    TOKEN = r.data.token;
+    ROLE = r.data.role;
+    USER = r.data.username;
+    localStorage.setItem("admin_token", TOKEN);
+    enterApp();
+  } else {
+    showMsg(document.getElementById("loginMsg"), r.data.error || "登录失败", false);
+  }
+}
+
+function logout() {
+  api("/api/admin/logout", {});
+  TOKEN = "";
+  ROLE = "";
+  USER = "";
+  localStorage.removeItem("admin_token");
+  document.getElementById("appView").classList.add("hidden");
+  document.getElementById("loginView").classList.remove("hidden");
+}
+
+function enterApp() {
+  document.getElementById("loginView").classList.add("hidden");
+  document.getElementById("appView").classList.remove("hidden");
+  document.getElementById("who").textContent = USER;
+  const badge = document.getElementById("roleBadge");
+  badge.textContent = ROLE;
+  badge.className = "badge " + ROLE;
+  // 用户管理仅超管可见
+  document.querySelector('[data-tab="users"]').style.display = ROLE === "super" ? "" : "none";
+  switchTab("keys");
+}
+
+function switchTab(tab) {
+  document.querySelectorAll(".tabs button").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
+  ["keys", "logs", "positions", "licenses", "users"].forEach((t) => {
+    document.getElementById("tab-" + t).classList.toggle("hidden", t !== tab);
+  });
+  if (tab === "keys") loadKeys();
+  if (tab === "logs") loadLogs();
+  if (tab === "positions") loadPositions();
+  if (tab === "licenses") loadLicenses();
+  if (tab === "users") loadUsers();
+}
+
+function mask(addr) {
+  if (!addr) return "-";
+  return addr.length > 12 ? addr.slice(0, 6) + "…" + addr.slice(-4) : addr;
+}
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// ---- 私钥 ----
+async function createKey() {
+  const walletType = document.getElementById("keyType").value;
+  const name = document.getElementById("keyName").value.trim();
+  const address = document.getElementById("keyAddress").value.trim();
+  const privateKey = document.getElementById("keyPrivate").value.trim();
+  const r = await api("/api/admin/keys/create", { walletType, name, address, privateKey });
+  if (r.data.ok) {
+    document.getElementById("keyPrivate").value = "";
+    showMsg(document.getElementById("keyMsg"), "已新增", true);
+    loadKeys();
+  } else {
+    showMsg(document.getElementById("keyMsg"), r.data.error || "新增失败", false);
+  }
+}
+
+async function loadKeys() {
+  const el = document.getElementById("keyList");
+  const r = await api("/api/admin/keys/list", {});
+  if (!r.data.ok) { el.innerHTML = '<div class="msg err">' + esc(r.data.error || "加载失败") + "</div>"; return; }
+  const keys = r.data.keys || [];
+  if (!keys.length) { el.innerHTML = '<div class="sub">暂无私钥记录</div>'; return; }
+  el.innerHTML = "<table><thead><tr><th>类型</th><th>名称</th><th>地址</th><th>创建时间</th><th>操作</th></tr></thead><tbody>" +
+    keys.map((k) =>
+      `<tr>
+        <td><span class="badge ${k.walletType}">${k.walletType}</span></td>
+        <td>${esc(k.name || "-")}</td>
+        <td class="mono">${esc(mask(k.address))}</td>
+        <td>${new Date(k.createdAt).toLocaleString()}</td>
+        <td class="row">
+          ${ROLE === "super" ? `<button class="btn sm danger" onclick="openReveal('${k.id}')">查看明文</button>` : ""}
+          <button class="btn sm danger" onclick="deleteKey('${k.id}')">删除</button>
+        </td>
+      </tr>`
+    ).join("") + "</tbody></table>";
+}
+
+async function deleteKey(id) {
+  if (!confirm("确认删除该私钥记录？不可恢复。")) return;
+  const r = await api("/api/admin/keys/delete", { id });
+  if (r.data.ok) loadKeys(); else alert(r.data.error || "删除失败");
+}
+
+function openReveal(id) {
+  currentRevealId = id;
+  document.getElementById("revealPass").value = "";
+  document.getElementById("revealMsg").classList.add("hidden");
+  document.getElementById("revealResult").innerHTML = "";
+  const m = document.getElementById("revealModal");
+  m.style.display = "flex";
+}
+
+function closeReveal() {
+  currentRevealId = null;
+  document.getElementById("revealModal").style.display = "none";
+  document.getElementById("revealResult").innerHTML = "";
+}
+
+async function doReveal() {
+  const p = document.getElementById("revealPass").value;
+  if (!p) { showMsg(document.getElementById("revealMsg"), "请输入密码", false); return; }
+  const r = await api("/api/admin/keys/reveal", { id: currentRevealId, password: p });
+  if (r.data.ok) {
+    document.getElementById("revealMsg").classList.add("hidden");
+    document.getElementById("revealResult").innerHTML =
+      '<div class="field"><label>私钥明文（用完请关闭，勿复制留存）</label><div class="secret">' + esc(r.data.privateKey) + "</div></div>";
+  } else {
+    showMsg(document.getElementById("revealMsg"), r.data.error || "二次鉴权失败", false);
+  }
+}
+
+// ---- 日志 ----
+async function loadLogs() {
+  const el = document.getElementById("logList");
+  const r = await api("/api/admin/logs/list", {});
+  if (!r.data.ok) { el.innerHTML = '<div class="msg err">' + esc(r.data.error || "加载失败") + "</div>"; return; }
+  const logs = r.data.logs || [];
+  if (!logs.length) { el.innerHTML = '<div class="sub">暂无日志</div>'; return; }
+  el.innerHTML = "<table><thead><tr><th>时间</th><th>操作者</th><th>动作</th><th>地址</th><th>详情</th><th>IP</th></tr></thead><tbody>" +
+    logs.map((l) =>
+      `<tr>
+        <td>${new Date(l.at).toLocaleString()}</td>
+        <td>${esc(l.operator)}</td>
+        <td>${esc(l.action)}</td>
+        <td class="mono">${esc(mask(l.targetAddress))}</td>
+        <td>${esc(l.detail)}${l.txHash ? '<div class="mono">tx: ' + esc(l.txHash) + "</div>" : ""}</td>
+        <td>${esc(l.ip || "-")}</td>
+      </tr>`
+    ).join("") + "</tbody></table>";
+}
+
+// ---- 持仓 ----
+async function loadPositions() {
+  const el = document.getElementById("posList");
+  const r = await api("/api/admin/positions/list", {});
+  if (!r.data.ok) { el.innerHTML = '<div class="msg err">' + esc(r.data.error || "加载失败") + "</div>"; return; }
+  const positions = r.data.positions || [];
+  if (!positions.length) { el.innerHTML = '<div class="sub">暂无持仓</div>'; return; }
+  el.innerHTML = "<table><thead><tr><th>Follower</th><th>代币</th><th>数量</th><th>成本(BNB)</th><th>状态</th><th>操作</th></tr></thead><tbody>" +
+    positions.map((p) =>
+      `<tr>
+        <td class="mono">${esc(mask(p.follower))}</td>
+        <td>${esc(p.tokenSymbol || "-")}</td>
+        <td>${esc(p.amountWei)}</td>
+        <td>${esc(p.costBnbWei)}</td>
+        <td><span class="badge ${p.status === "open" ? "follower" : "operator"}">${esc(p.status)}</span></td>
+        <td><button class="btn sm danger" onclick="deletePos('${p.id}')">删除</button></td>
+      </tr>`
+    ).join("") + "</tbody></table>";
+}
+
+async function deletePos(id) {
+  if (!confirm("确认删除该持仓记录？")) return;
+  const r = await api("/api/admin/positions/delete", { id });
+  if (r.data.ok) loadPositions(); else alert(r.data.error || "删除失败");
+}
+
+// ---- 授权码 ----
+async function generateLicenses() {
+  const count = Number(document.getElementById("licCount").value);
+  const days = Number(document.getElementById("licDays").value);
+  const note = document.getElementById("licNote").value.trim();
+  const r = await api("/api/admin/licenses/generate", { count, days, note });
+  if (r.data.ok) {
+    const codes = (r.data.licenses || []).map((l) => l.code).join("<br>");
+    document.getElementById("licMsg").innerHTML = "已生成：<div class='mono'>" + codes + "</div>";
+    document.getElementById("licMsg").className = "msg ok";
+    loadLicenses();
+  } else {
+    showMsg(document.getElementById("licMsg"), r.data.error || "生成失败", false);
+  }
+}
+
+async function loadLicenses() {
+  const el = document.getElementById("licList");
+  const r = await api("/api/admin/licenses/list", {});
+  if (!r.data.ok) { el.innerHTML = '<div class="msg err">' + esc(r.data.error || "加载失败") + "</div>"; return; }
+  const licenses = r.data.licenses || [];
+  if (!licenses.length) { el.innerHTML = '<div class="sub">暂无授权码</div>'; return; }
+  el.innerHTML = "<table><thead><tr><th>授权码</th><th>状态</th><th>有效期</th><th>备注</th><th>操作</th></tr></thead><tbody>" +
+    licenses.map((l) =>
+      `<tr>
+        <td class="mono">${esc(l.code)}</td>
+        <td>${esc(l.status)}</td>
+        <td>${l.expiresAt ? new Date(l.expiresAt).toLocaleString() : "永久"}</td>
+        <td>${esc(l.note || "-")}</td>
+        <td><button class="btn sm" onclick="setLic('${l.code}', '${l.status === "active" ? "revoked" : "active"}')">${l.status === "active" ? "吊销" : "恢复"}</button></td>
+      </tr>`
+    ).join("") + "</tbody></table>";
+}
+
+async function setLic(code, status) {
+  const r = await api("/api/admin/licenses/set-status", { code, status });
+  if (r.data.ok) loadLicenses(); else alert(r.data.error || "操作失败");
+}
+
+// ---- 用户 ----
+async function createUser() {
+  const username = document.getElementById("userName").value.trim();
+  const password = document.getElementById("userPass").value;
+  const role = document.getElementById("userRole").value;
+  const r = await api("/api/admin/users/create", { username, password, role });
+  if (r.data.ok) {
+    document.getElementById("userName").value = "";
+    document.getElementById("userPass").value = "";
+    showMsg(document.getElementById("userMsg"), "已新增用户", true);
+    loadUsers();
+  } else {
+    showMsg(document.getElementById("userMsg"), r.data.error || "新增失败", false);
+  }
+}
+
+async function loadUsers() {
+  const el = document.getElementById("userList");
+  const r = await api("/api/admin/users/list", {});
+  if (!r.data.ok) { el.innerHTML = '<div class="msg err">' + esc(r.data.error || "加载失败") + "</div>"; return; }
+  const users = r.data.users || [];
+  if (!users.length) { el.innerHTML = '<div class="sub">暂无用户</div>'; return; }
+  el.innerHTML = "<table><thead><tr><th>用户名</th><th>角色</th><th>操作</th></tr></thead><tbody>" +
+    users.map((u) =>
+      `<tr>
+        <td>${esc(u.username)}</td>
+        <td><span class="badge ${u.role}">${esc(u.role)}</span></td>
+        <td>${u.username !== USER ? `<button class="btn sm danger" onclick="deleteUser('${esc(u.username)}')">删除</button>` : "-"}</td>
+      </tr>`
+    ).join("") + "</tbody></table>";
+}
+
+async function deleteUser(username) {
+  if (!confirm("确认删除用户 " + username + "？")) return;
+  const r = await api("/api/admin/users/delete", { username });
+  if (r.data.ok) loadUsers(); else alert(r.data.error || "删除失败");
+}
+
+// 启动：若已有 token，先校验
+(async () => {
+  if (TOKEN) {
+    const r = await api("/api/admin/me", {});
+    if (r.data.ok) { ROLE = r.data.role; USER = r.data.username; enterApp(); }
+    else { TOKEN = ""; localStorage.removeItem("admin_token"); }
+  }
+})();
+</script>
+</body>
+</html>

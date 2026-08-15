@@ -10,30 +10,12 @@ import { pickProvider } from "./utils/rpc";
 
 type Tab = "transfer" | "copytrade";
 
-const LICENSE_STORAGE_KEY = "bnb_tool_license";
-
-function readStoredLicense(): boolean {
-  try {
-    const raw = localStorage.getItem(LICENSE_STORAGE_KEY);
-    if (!raw) return false;
-    if (raw === "permanent") return true;
-    const expiresAt = Number(raw);
-    return Number.isFinite(expiresAt) && expiresAt > Date.now();
-  } catch {
-    return false;
-  }
-}
-
-function storeLicense(expiresAt: number | null): void {
-  try {
-    localStorage.setItem(
-      LICENSE_STORAGE_KEY,
-      expiresAt == null ? "permanent" : String(expiresAt)
-    );
-  } catch {
-    // 忽略存储失败（隐私模式等）
-  }
-}
+// 授权安全模型（Fail Closed）：
+// - 客户端不再信任任何 localStorage/sessionStorage/IndexedDB 中的“授权/时间戳”状态，
+//   杜绝手工写入 bnb_tool_license=permanent 或未来时间戳绕过授权；
+// - 每次启动都必须通过服务端在线验证（一次性 session 或手动输入授权码），
+//   授权码被吊销后下次启动即失效；
+// - 开发环境绕过仅在 import.meta.env.DEV 下生效，生产构建恒为 false，无法绕过。
 
 function TabButton({
   active,
@@ -67,7 +49,7 @@ export default function App() {
   // 因此即使误设 VITE_BYPASS_LICENSE=1，也无法绕过授权（Fail Closed）。
   const licenseBypass =
     import.meta.env.DEV && import.meta.env.VITE_BYPASS_LICENSE === "1";
-  const [verified, setVerified] = useState(licenseBypass || readStoredLicense());
+  const [verified, setVerified] = useState(licenseBypass);
   const [checkingSession, setCheckingSession] = useState(false);
   const [networkKey, setNetworkKey] = useState<NetworkKey>("bsc-testnet");
   const [tab, setTab] = useState<Tab>("transfer");
@@ -90,7 +72,6 @@ export default function App() {
     verifySession(token)
       .then((res) => {
         if (res.ok) {
-          storeLicense(res.expiresAt ?? null);
           setVerified(true);
         }
       })
@@ -142,8 +123,7 @@ export default function App() {
     }
     return (
       <LicenseGate
-        onVerified={(expiresAt) => {
-          storeLicense(expiresAt);
+        onVerified={() => {
           setVerified(true);
         }}
       />

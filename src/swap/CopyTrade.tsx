@@ -42,6 +42,7 @@ interface SignalFollowerResult {
   status: SimpleTxStatus;
   txHash?: string;
   error?: string;
+  phase?: string;
 }
 
 interface SignalLogEntry {
@@ -176,6 +177,8 @@ export function CopyTrade({
   // 自动监听状态
   const [monitoring, setMonitoring] = useState(false);
   const [monitorStarting, setMonitorStarting] = useState(false);
+  // 自动执行出现 unknown 后进入待对账，要求人工核对链上结果后才能重启监听
+  const [reconcileRequired, setReconcileRequired] = useState(false);
   const [signalLog, setSignalLog] = useState<SignalLogEntry[]>([]);
   const monitorRef = useRef<TradeMonitor | null>(null);
   // 单线程 FIFO 信号队列：busy → enqueue，不并发、不丢信号；
@@ -192,6 +195,10 @@ export function CopyTrade({
   const activeSignalHashesRef = useRef<Set<string>>(new Set());
   // 防止 startMonitor 重入（快速双击创建两个监听器）
   const monitorStartingRef = useRef(false);
+  // 待对账标记：unknown 后置 true，人工确认前禁止重启监听
+  const reconcileRequiredRef = useRef(false);
+  // 本工具人工广播的 Leader 买入 txHash，监听不得将其作为外部信号重复跟单
+  const manualLeaderTxHashesRef = useRef<Set<string>>(new Set());
   // 组件生命周期 + 启动代际：防止异步 startMonitor 在组件卸载后创建孤儿 Monitor
   const mountedRef = useRef(true);
   const monitorGenerationRef = useRef(0);
@@ -468,6 +475,15 @@ export function CopyTrade({
   }
 
   async function start() {
+    // 自动监听与人工跟单互斥（代码级防线，UI 禁用仅为第一道防线）
+    if (monitoring || monitorRef.current) {
+      setError("自动监听运行中，请先停止监听再手动跟单");
+      return;
+    }
+    if (monitorStartingRef.current) {
+      setError("监听正在启动中，请稍后再试");
+      return;
+    }
     if (executionRef.current) return;
     executionRef.current = true;
     setIsExecuting(true);
@@ -553,6 +569,11 @@ export function CopyTrade({
           r.txHash
         );
       }
+      // 记录本工具人工广播的 Leader 买入 txHash，监听重启后不得将其作为外部信号重复跟单
+      const leaderTx = finalResults.find((r) => r.role === "leader");
+      if (leaderTx?.txHash) {
+        manualLeaderTxHashesRef.current.add(leaderTx.txHash.toLowerCase());
+      }
       setPositions(listPositions(network.chainId));
     } catch (e) {
       setError(safeErrorMessage(e));
@@ -568,6 +589,11 @@ export function CopyTrade({
   }
 
   async function sellPosition(pos: Position, percentText: string) {
+    // 自动监听运行中禁止人工卖出（互斥）
+    if (monitoring || monitorRef.current) {
+      setError("自动监听运行中，请先停止监听再手动卖出");
+      return;
+    }
     if (executionRef.current) return;
 
     // 跨链 Fail Closed：持仓链与当前网络不一致时禁止任何广播
@@ -696,6 +722,25 @@ export function CopyTrade({
     markPendingCancelled(reason);
   }
 
+  // 自动执行出现 unknown（已广播但无法确认）→ 进入待对账：停止监听 + 停止消费队列 + 要求人工核对
+  function enterReconciliation(reason: string) {
+    reconcileRequiredRef.current = true;
+    setReconcileRequired(true);
+    monitorRef.current?.stop();
+    monitorRef.current = null;
+    haltAuto(reason);
+    setMonitoring(false);
+    setError(reason);
+  }
+
+  function confirmReconcile() {
+    reconcileRequiredRef.current = false;
+    setReconcileRequired(false);
+    setPositions(listPositions(network.chainId)); // 重新加载持仓
+    setError("");
+    setMessage("已确认人工核对，可重新启动监听");
+  }
+
   function handleSignal(signal: TradeSignal) {
     // Halt 门禁：Stop/Fail Closed 后晚到的信号绝不进入队列，标记 cancelled 供人工核对。
     // 记录 txHash 到 accepted，确保 Restart 后也不会自动重复执行这笔旧信号。
@@ -711,6 +756,22 @@ export function CopyTrade({
         status: "cancelled",
         summary: "信号在自动监听停止后返回，未执行，请人工核对",
       });
+      return;
+    }
+
+    // 本工具人工带单的交易不作为外部信号重复执行（第二道保护）
+    if (manualLeaderTxHashesRef.current.has(signal.txHash.toLowerCase())) {
+      if (!acceptedSignalHashesRef.current.has(signal.txHash)) {
+        acceptedSignalHashesRef.current.set(signal.txHash, signal.blockNumber);
+        upsertSignalLog({
+          txHash: signal.txHash,
+          direction: signal.direction,
+          tokenSymbol: "",
+          amountText: "",
+          status: "cancelled",
+          summary: "本工具人工带单交易，不重复自动跟单",
+        });
+      }
       return;
     }
 
@@ -866,6 +927,7 @@ export function CopyTrade({
         status: r.status,
         txHash: r.txHash,
         error: r.error,
+        phase: "买入",
       }));
       const ok = buyResults.filter((r) => r.status === "success").length;
       const failed = buyResults.filter((r) => r.status === "failed").length;
@@ -875,15 +937,26 @@ export function CopyTrade({
       if (failed > 0) parts.push(`失败 ${failed}`);
       if (unknown > 0) parts.push(`待确认 ${unknown}`);
 
+      const buySummary = hasUnknown
+        ? `跟单买入完成：${parts.join("，")}。存在待确认交易：链 ${network.chainId}，代币 ${signal.tokenAddress}，方向 买入，请人工核对链上结果后重新启动`
+        : `跟单买入完成：${parts.join("，")}`;
+
       upsertSignalLog({
         txHash: signal.txHash,
         direction: "buy",
         tokenSymbol: meta.symbol,
         amountText: ethers.formatEther(signal.amountInWei),
         status: hasUnknown ? "attention" : "done",
-        summary: `跟单买入完成：${parts.join("，")}`,
+        summary: buySummary,
         followers: followerDetails,
       });
+
+      // 任意钱包出现 unknown → 立即进入待对账并停止监听，禁止继续消费信号
+      if (hasUnknown) {
+        enterReconciliation(
+          "跟单买入出现待确认交易，已停止自动监听，请人工核对链上结果后重新启动"
+        );
+      }
     } catch (e) {
       upsertSignalLog({
         txHash: signal.txHash,
@@ -943,6 +1016,7 @@ export function CopyTrade({
         status: r.status,
         txHash: r.txHash,
         error: r.error,
+        phase: r.phase === "approval" ? "授权" : "卖出",
       }));
       const ok = sellResults.filter((r) => r.status === "success").length;
       const failed = sellResults.filter((r) => r.status === "failed").length;
@@ -955,15 +1029,26 @@ export function CopyTrade({
       if (skipped > 0) parts.push(`跳过 ${skipped}`);
       if (unknown > 0) parts.push(`待确认 ${unknown}`);
 
+      const sellSummary = hasUnknown
+        ? `跟卖完成：${parts.join("，")}。存在待确认交易：链 ${network.chainId}，代币 ${signal.tokenAddress}，方向 卖出，请人工核对链上结果后重新启动`
+        : `跟卖完成：${parts.join("，")}`;
+
       upsertSignalLog({
         txHash: signal.txHash,
         direction: "sell",
         tokenSymbol: symbol,
         amountText: "",
         status: hasUnknown ? "attention" : "done",
-        summary: `跟卖完成：${parts.join("，")}`,
+        summary: sellSummary,
         followers: followerDetails,
       });
+
+      // 任意钱包出现 unknown → 立即进入待对账并停止监听，禁止继续消费信号
+      if (hasUnknown) {
+        enterReconciliation(
+          "跟卖出现待确认交易，已停止自动监听，请人工核对链上结果后重新启动"
+        );
+      }
     } catch (e) {
       upsertSignalLog({
         txHash: signal.txHash,
@@ -979,6 +1064,16 @@ export function CopyTrade({
   async function startMonitor() {
     // 防重入：已启动或正在启动中直接返回，避免快速双击创建多个监听器
     if (monitorRef.current || monitorStartingRef.current) return;
+    // 人工跟单执行中禁止启动监听（互斥）
+    if (executionRef.current) {
+      setError("手动跟单执行中，无法开始监听");
+      return;
+    }
+    // 存在待人工核对的交易，须先确认链上结果再重启监听
+    if (reconcileRequiredRef.current) {
+      setError("存在待人工核对的交易，请先核对链上结果并确认后再启动监听");
+      return;
+    }
     monitorStartingRef.current = true;
     setMonitorStarting(true);
     // 启动窗口内锁定父级 network/tab 切换，作为 UX 防线（代码层 guard 才是资金安全保证）
@@ -1087,7 +1182,7 @@ export function CopyTrade({
         <div className="inline-flex rounded-lg bg-gray-800 border border-gray-700 p-1 mb-4">
           <button
             onClick={() => switchLeaderMode("privateKey")}
-            disabled={isExecuting}
+            disabled={isExecuting || monitoring}
             className={`px-3 py-1.5 rounded-md text-sm ${
               leaderMode === "privateKey"
                 ? "bg-gray-600 text-white"
@@ -1098,7 +1193,7 @@ export function CopyTrade({
           </button>
           <button
             onClick={() => switchLeaderMode("metamask")}
-            disabled={isExecuting}
+            disabled={isExecuting || monitoring}
             className={`px-3 py-1.5 rounded-md text-sm ${
               leaderMode === "metamask"
                 ? "bg-gray-600 text-white"
@@ -1119,13 +1214,13 @@ export function CopyTrade({
                     type="password"
                     value={leaderPrivateKey}
                     onChange={(e) => handleLeaderPrivateKeyChange(e.target.value)}
-                    disabled={isExecuting}
+                    disabled={isExecuting || monitoring}
                     placeholder="0x..."
                     className="flex-1 px-3 py-2 rounded-md bg-gray-800 border border-gray-700 font-mono focus:outline-none focus:border-blue-500 disabled:opacity-50"
                   />
                   <button
                     onClick={loadLeader}
-                    disabled={isExecuting || !rpcReady}
+                    disabled={isExecuting || monitoring || !rpcReady}
                     className="px-4 py-2 rounded-md bg-gray-700 hover:bg-gray-600 disabled:opacity-50"
                   >
                     读取
@@ -1136,7 +1231,7 @@ export function CopyTrade({
               <div className="flex gap-2">
                 <button
                   onClick={connectMeta}
-                  disabled={isExecuting || !rpcReady}
+                  disabled={isExecuting || monitoring || !rpcReady}
                   className="px-4 py-2 rounded-md bg-orange-600 hover:bg-orange-500 disabled:opacity-50 font-medium"
                 >
                   连接小狐狸
@@ -1144,7 +1239,7 @@ export function CopyTrade({
                 {leaderWallet && (
                   <button
                     onClick={disconnectMeta}
-                    disabled={isExecuting}
+                    disabled={isExecuting || monitoring}
                     className="px-4 py-2 rounded-md bg-gray-700 hover:bg-gray-600 disabled:opacity-50"
                   >
                     断开
@@ -1172,7 +1267,7 @@ export function CopyTrade({
               type="text"
               value={leaderAmountText}
               onChange={(e) => setLeaderAmountText(e.target.value)}
-              disabled={isExecuting}
+              disabled={isExecuting || monitoring}
               placeholder="0.5"
               className="w-full px-3 py-2 rounded-md bg-gray-800 border border-gray-700 focus:outline-none focus:border-blue-500 disabled:opacity-50"
             />
@@ -1188,7 +1283,7 @@ export function CopyTrade({
             <textarea
               value={followersText}
               onChange={(e) => handleFollowersTextChange(e.target.value)}
-              disabled={isExecuting}
+              disabled={isExecuting || monitoring}
               rows={5}
               placeholder={"0xPRIVATEKEY1\n0xPRIVATEKEY2\n0xPRIVATEKEY3"}
               className="w-full px-3 py-2 rounded-md bg-gray-800 border border-gray-700 font-mono text-sm focus:outline-none focus:border-blue-500 disabled:opacity-50"
@@ -1200,13 +1295,13 @@ export function CopyTrade({
               type="text"
               value={defaultAmountText}
               onChange={(e) => handleDefaultAmountChange(e.target.value)}
-              disabled={isExecuting}
+              disabled={isExecuting || monitoring}
               placeholder="0.1"
               className="w-full px-3 py-2 rounded-md bg-gray-800 border border-gray-700 focus:outline-none focus:border-blue-500 disabled:opacity-50"
             />
             <button
               onClick={parseFollowers}
-              disabled={isExecuting || !rpcReady}
+              disabled={isExecuting || monitoring || !rpcReady}
               className="mt-3 px-4 py-2 rounded-md bg-gray-700 hover:bg-gray-600 disabled:opacity-50"
             >
               解析跟单钱包
@@ -1238,7 +1333,7 @@ export function CopyTrade({
                         type="text"
                         value={f.buyAmountText}
                         onChange={(e) => updateFollowerAmount(f.id, e.target.value)}
-                        disabled={isExecuting}
+                        disabled={isExecuting || monitoring}
                         className="w-20 px-2 py-1 rounded-md bg-gray-800 border border-gray-700 text-sm focus:outline-none focus:border-blue-500 disabled:opacity-50"
                       />
                     </td>
@@ -1260,13 +1355,13 @@ export function CopyTrade({
                 type="text"
                 value={tokenAddress}
                 onChange={(e) => handleTokenAddressChange(e.target.value)}
-                disabled={isExecuting}
+                disabled={isExecuting || monitoring}
                 placeholder="0xTOKEN..."
                 className="flex-1 px-3 py-2 rounded-md bg-gray-800 border border-gray-700 font-mono focus:outline-none focus:border-blue-500 disabled:opacity-50"
               />
               <button
                 onClick={loadToken}
-                disabled={isExecuting || !rpcReady}
+                disabled={isExecuting || monitoring || !rpcReady}
                 className="px-4 py-2 rounded-md bg-gray-700 hover:bg-gray-600 disabled:opacity-50"
               >
                 读取
@@ -1284,7 +1379,7 @@ export function CopyTrade({
               type="text"
               value={slippageText}
               onChange={(e) => setSlippageText(e.target.value)}
-              disabled={isExecuting}
+              disabled={isExecuting || monitoring}
               className="w-full px-3 py-2 rounded-md bg-gray-800 border border-gray-700 focus:outline-none focus:border-blue-500 disabled:opacity-50"
             />
           </div>
@@ -1294,7 +1389,7 @@ export function CopyTrade({
                 type="checkbox"
                 checked={supportFeeOnTransfer}
                 onChange={(e) => setSupportFeeOnTransfer(e.target.checked)}
-                disabled={isExecuting}
+                disabled={isExecuting || monitoring}
                 className="accent-blue-600"
               />
               含税代币兼容模式
@@ -1305,14 +1400,14 @@ export function CopyTrade({
         <div className="mt-4 flex items-center gap-3">
           <button
             onClick={validate}
-            disabled={isExecuting}
+            disabled={isExecuting || monitoring}
             className="px-4 py-2 rounded-md bg-gray-700 hover:bg-gray-600 disabled:opacity-50"
           >
             校验
           </button>
           <button
             onClick={start}
-            disabled={isExecuting || !rpcReady}
+            disabled={isExecuting || monitoring || monitorStarting || !rpcReady}
             className="px-4 py-2 rounded-md bg-blue-600 hover:bg-blue-500 disabled:opacity-50 font-medium"
           >
             {isExecuting ? "执行中..." : "开始跟单"}
@@ -1355,6 +1450,20 @@ export function CopyTrade({
           只触发一次。
         </p>
 
+        {reconcileRequired && (
+          <div className="mt-3 rounded-lg border border-orange-800 bg-orange-900/20 px-4 py-3 flex items-center justify-between gap-3">
+            <p className="text-sm text-orange-300">
+              存在待人工核对的链上交易，请先核对结果并确认后再重启监听。
+            </p>
+            <button
+              onClick={confirmReconcile}
+              className="px-3 py-1.5 rounded-md bg-orange-600 hover:bg-orange-500 text-sm whitespace-nowrap"
+            >
+              我已人工核对
+            </button>
+          </div>
+        )}
+
         {signalLog.length > 0 && (
           <div className="mt-3 overflow-x-auto">
             <table className="w-full text-sm">
@@ -1396,6 +1505,7 @@ export function CopyTrade({
                               <div key={i} className="text-orange-300">
                                 {f.name} ·{" "}
                                 <span className="font-mono">{f.address}</span>
+                                {f.phase ? ` · ${f.phase}` : ""}
                                 {f.txHash ? (
                                   <>
                                     {" · "}
@@ -1540,7 +1650,7 @@ export function CopyTrade({
                             [posKey(p)]: e.target.value,
                           }))
                         }
-                        disabled={isExecuting}
+                        disabled={isExecuting || monitoring}
                         className="w-16 px-2 py-1 rounded-md bg-gray-800 border border-gray-700 text-sm focus:outline-none focus:border-blue-500 disabled:opacity-50"
                       />
                       <span className="ml-1 text-gray-400">%</span>
@@ -1550,7 +1660,7 @@ export function CopyTrade({
                         onClick={() =>
                           sellPosition(p, sellPct[posKey(p)] ?? "100")
                         }
-                        disabled={isExecuting}
+                        disabled={isExecuting || monitoring}
                         className="px-3 py-1 rounded-md bg-red-600 hover:bg-red-500 disabled:opacity-50 text-sm"
                       >
                         卖出

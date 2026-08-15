@@ -1,4 +1,4 @@
-const { app, BrowserWindow, shell, ipcMain } = require("electron");
+const { app, BrowserWindow, shell, ipcMain, dialog } = require("electron");
 const http = require("node:http");
 const { readFile } = require("node:fs/promises");
 const { extname, join, normalize } = require("node:path");
@@ -70,12 +70,19 @@ if (!app.requestSingleInstanceLock()) {
   });
 
   app.whenReady().then(async () => {
-    // 启动前端静态服务器（固定端口，占用则回退到随机端口）
+    // 固定端口（默认 4173）；被占用时不再回退到随机端口，
+    // 否则授权 CORS 白名单（仅 4173/5173）无法放行随机端口，授权 session 无法被消费。
+    // 改为显示明确错误并退出，提示用户关闭占用端口的程序后重试。
     let server;
     try {
       server = await createStaticServer(appPort);
     } catch {
-      server = await createStaticServer(0);
+      dialog.showErrorBox(
+        "端口被占用",
+        `端口 ${appPort} 被占用，无法启动。\n请关闭占用该端口的程序后重新启动本工具。`
+      );
+      app.quit();
+      return;
     }
     appPort = server.address().port;
 

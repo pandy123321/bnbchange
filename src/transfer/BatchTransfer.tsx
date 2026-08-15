@@ -14,6 +14,7 @@ import {
   totalAmountWei,
 } from "./parser";
 import {
+  checkTransferFunds,
   estimateTransferGas,
   fetchTokenConfig,
   formatAmount,
@@ -289,16 +290,17 @@ export function BatchTransfer({
         return;
       }
 
-      // 1) 转账本金预检：所选币种余额须 ≥ 本金
-      const tokenBalance = await getTokenBalance(token, wallet.address, provider);
-      if (tokenBalance < totalValue) {
-        setError(
-          `余额不足：需 ${formatAmount(totalValue, token.decimals)} ${token.symbol}，当前 ${formatAmount(tokenBalance, token.decimals)} ${token.symbol}`
-        );
+      // Gas 价格在批量估算前读取一次，避免每笔重复读取
+      let gasPrice: bigint;
+      try {
+        const feeData = await provider.getFeeData();
+        gasPrice = feeData.gasPrice ?? feeData.maxFeePerGas ?? 1_000_000_000n;
+      } catch (e) {
+        setError(`无法获取 Gas 价格：${safeErrorMessage(e)}`);
         return;
       }
 
-      // 2) Gas 预检：逐笔估算（原生币支付 gas）
+      // Gas 预检：逐笔估算（原生币支付 gas）
       const nativeBalance = await provider.getBalance(wallet.address);
       let totalGasCost = 0n;
       try {
@@ -309,9 +311,6 @@ export function BatchTransfer({
             r.address,
             r.amountWei
           );
-          const feeData = await provider.getFeeData();
-          const gasPrice =
-            feeData.gasPrice ?? feeData.maxFeePerGas ?? 1_000_000_000n;
           totalGasCost += gasLimit * gasPrice;
         }
       } catch (e) {
@@ -321,10 +320,19 @@ export function BatchTransfer({
         return;
       }
 
-      if (nativeBalance < totalGasCost) {
-        setError(
-          `原生币不足：需 ${ethers.formatEther(totalGasCost)} ${network.nativeSymbol} 用于支付 Gas，当前 ${ethers.formatEther(nativeBalance)} ${network.nativeSymbol}`
-        );
+      // 余额预检：原生币合并判断（本金 + Gas），ERC20 分别判断（本金 / Gas）
+      const tokenBalance = isNative(token)
+        ? nativeBalance
+        : await getTokenBalance(token, wallet.address, provider);
+      const funds = checkTransferFunds(
+        token,
+        tokenBalance,
+        nativeBalance,
+        totalValue,
+        totalGasCost
+      );
+      if (!funds.ok) {
+        setError(funds.reason ?? "余额不足");
         return;
       }
 

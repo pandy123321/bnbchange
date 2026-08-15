@@ -23,6 +23,7 @@ export interface TradeMonitorConfig {
   wbnbAddress: string;
   expectedChainId: number;
   pollIntervalMs?: number;
+  confirmationDepth?: number;
   onSignal: (signal: TradeSignal) => void;
   onError: (error: Error) => void;
   // Fail Closed 时通知上层（monitor 已自行停止），用于 UI 同步监听状态
@@ -40,9 +41,13 @@ const MAX_TX_CACHE = 10_000;
 const MAX_SCAN_BEHIND = 20;
 // RPC 连续失败达该次数时 Fail Closed（短暂抖动可容忍，持续不可靠则停止自动执行）
 const MAX_CONSECUTIVE_FAILURES = 3;
+// 区块确认深度：仅扫描不高于 safeHead = current - CONFIRMATION_DEPTH 的区块，
+// 抵御短链重组导致已触发信号被回滚。集中定义，供测试覆盖。
+export const CONFIRMATION_DEPTH = 3;
 
 export function startTradeMonitor(config: TradeMonitorConfig): TradeMonitor {
   const iface = new ethers.Interface(PANCAKE_ROUTER_V2_ABI);
+  const confirmationDepth = config.confirmationDepth ?? CONFIRMATION_DEPTH;
   // 只缓存 Leader→Router 候选交易的 hash，FIFO 淘汰；避免缓存所有普通区块交易
   const seenTx = new Map<string, true>();
   const leader = config.leaderAddress.toLowerCase();
@@ -192,26 +197,28 @@ export function startTradeMonitor(config: TradeMonitorConfig): TradeMonitor {
       if (stopped) return;
 
       const current = await config.provider.getBlockNumber();
+      // 安全高度：仅扫描已达到确认深度的区块，抵御短链重组
+      const safeHead = Math.max(0, current - confirmationDepth);
       if (!initialized) {
         initialized = true;
-        lastBlock = current;
+        lastBlock = safeHead;
         consecutiveFailures = 0;
         return;
       }
-      if (current <= lastBlock) {
+      if (safeHead <= lastBlock) {
         consecutiveFailures = 0;
         return;
       }
 
       const start = lastBlock + 1;
-      if (current - start > MAX_SCAN_BEHIND) {
+      if (safeHead - start > MAX_SCAN_BEHIND) {
         failClosed(
           `监听落后超过 ${MAX_SCAN_BEHIND} 个区块，已停止自动执行，请人工核对期间带单交易后重新启动`
         );
         return;
       }
 
-      for (let b = start; b <= current; b++) {
+      for (let b = start; b <= safeHead; b++) {
         if (stopped) break;
         await scanBlock(b);
         // checkpoint 仅在完整成功扫描 Block b 后推进；

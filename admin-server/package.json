@@ -1,0 +1,13 @@
+{
+  "name": "bnbchange-admin-server",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "后台管理服务：授权验证 + 私钥加密托管 + 用户/RBAC + 操作日志 + 持仓管理",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ethers": "^6.17.0"
+  }
+}

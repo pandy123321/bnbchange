@@ -198,6 +198,7 @@ export interface SellFollowResult {
   tokenSymbol: string;
   sellAmountWei: bigint;
   status: SimpleTxStatus;
+  phase?: "approval" | "swap";
   txHash?: string;
   error?: string;
 }
@@ -281,6 +282,7 @@ export async function sellFollowersForToken(
       tokenSymbol: pos.tokenSymbol,
       sellAmountWei: pos.amountWei,
       status,
+      phase: status === "success" ? "swap" : res.phase,
       txHash,
       error: res.error,
     };

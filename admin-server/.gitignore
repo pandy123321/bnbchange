@@ -1,0 +1,12 @@
+# 主密钥 / 数据文件 / 环境变量 —— 绝不入库
+master.key
+MASTER_KEY
+.env
+.env.*
+
+# 运行时数据
+users.json
+keys.json
+audit.json
+positions.json
+licenses.json

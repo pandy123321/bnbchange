@@ -2,7 +2,7 @@ import type { NetworkConfig, TokenConfig } from "../config/networks";
 import type { SignerWallet, TransferRecipient, TransferResult } from "../types";
 import { assertExpectedChain } from "../utils/chain";
 import { isConfirmedRevert, safeErrorMessage } from "../utils/error";
-import { sendTransfer } from "./token";
+import { isNative, sendTransfer, verifyErc20Transfer } from "./token";
 
 export async function runBatchTransfer(
   wallet: SignerWallet,
@@ -57,12 +57,33 @@ export async function runBatchTransfer(
       const receipt = await tx.wait();
 
       if (receipt?.status === 1) {
-        onUpdate(i, {
-          address: recipient.address,
-          amount: recipient.amountText,
-          status: "success",
-          txHash,
-        });
+        // ERC20 收据成功但未检测到 Transfer 事件（返回 false 且未回滚）→ 待核对，不显示成功
+        if (
+          isNative(token) ||
+          verifyErc20Transfer(
+            receipt,
+            token.address!,
+            wallet.address,
+            recipient.address,
+            recipient.amountWei
+          )
+        ) {
+          onUpdate(i, {
+            address: recipient.address,
+            amount: recipient.amountText,
+            status: "success",
+            txHash,
+          });
+        } else {
+          onUpdate(i, {
+            address: recipient.address,
+            amount: recipient.amountText,
+            status: "unknown",
+            txHash,
+            error:
+              "交易已确认，但未检测到代币转账事件，请人工核对（代币可能返回 false 且未回滚）",
+          });
+        }
       } else {
         onUpdate(i, {
           address: recipient.address,
