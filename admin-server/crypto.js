@@ -15,7 +15,7 @@ let cachedKey = null;
 
 // 主密钥来源优先级：MASTER_KEY 环境变量 > MASTER_KEY_FILE 文件 > 默认 master.key 文件。
 // 缺失时 Fail Closed：任何加解密都抛错，绝不使用空/固定密钥。
-// MASTER_KEY 必须是 32 字节随机密钥（64 位 hex 或 base64），拒绝低熵口令：
+// MASTER_KEY 必须是 32 字节随机密钥（64 位 hex），拒绝低熵口令：
 // 若允许人类口令经单次 SHA-256 派生密钥，攻击者拿到 keys.json 后可离线爆破并解密全部托管私钥。
 function loadMasterKey() {
   let raw = process.env.MASTER_KEY;
@@ -34,19 +34,20 @@ function loadMasterKey() {
   return decodeMasterKey(raw);
 }
 
-// 严格解析 32 字节密钥：优先 64 位 hex，其次 base64；任何其它输入（含低熵口令）均 Fail Closed
+// 仅接受 64 位 hex（32 字节）。不使用 base64（Node 的宽松解码器会静默忽略非法字符），
+// 也不接受人类口令（避免低熵输入被快速 SHA-256 伪装成强密钥）。
+//
+// 这是 master-key 存储格式 cutover：旧版“任意口令 → SHA256”派生规则已彻底移除，
+// 旧开发测试 keys.json 不兼容；升级前必须删除旧测试数据，生产首次启用必须用 CSPRNG 生成：
+//   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 export function decodeMasterKey(raw) {
   const s = String(raw).trim();
-  if (/^[0-9a-fA-F]{64}$/.test(s)) {
-    return Buffer.from(s, "hex");
+  if (!/^[0-9a-fA-F]{64}$/.test(s)) {
+    throw new Error(
+      "MASTER_KEY 必须是 32 字节随机密钥（64 位 hex），不接受 base64 或低熵口令"
+    );
   }
-  const fromBase64 = Buffer.from(s, "base64");
-  if (fromBase64.length === 32) {
-    return fromBase64;
-  }
-  throw new Error(
-    "MASTER_KEY 必须是 32 字节随机密钥（64 位 hex 或 base64），不接受低熵口令"
-  );
+  return Buffer.from(s, "hex");
 }
 
 function getKey() {

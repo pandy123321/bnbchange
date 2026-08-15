@@ -229,6 +229,28 @@ describe("keyStore.js key/address 强一致（P1-1）", () => {
       rec.address.toLowerCase()
     );
   });
+
+  it("组合 patch（name+privateKey+错误 address）失败且持久化记录保持旧值", () => {
+    const w1 = ethers.Wallet.createRandom();
+    const rec = createKey({
+      walletType: "follower",
+      privateKey: w1.privateKey,
+      name: "old-name",
+    });
+    const w2 = ethers.Wallet.createRandom();
+    const w3 = ethers.Wallet.createRandom();
+    expect(() =>
+      updateKey(rec.id, {
+        name: "new-name",
+        privateKey: w2.privateKey,
+        address: w3.address,
+      })
+    ).toThrow();
+    const after = getKey(rec.id)!;
+    expect(after.address.toLowerCase()).toBe(w1.address.toLowerCase());
+    expect(after.name).toBe("old-name");
+    expect(revealKey(rec.id)).toBe(w1.privateKey);
+  });
 });
 
 describe("crypto.js MASTER_KEY 强度（P1-2）", () => {
@@ -236,9 +258,9 @@ describe("crypto.js MASTER_KEY 强度（P1-2）", () => {
     expect(decodeMasterKey("01".repeat(32)).length).toBe(32);
   });
 
-  it("32 字节 base64 解析成功", () => {
+  it("base64 输入被拒绝（仅支持 64 位 hex）", () => {
     const b64 = Buffer.from("x".repeat(32)).toString("base64");
-    expect(decodeMasterKey(b64).length).toBe(32);
+    expect(() => decodeMasterKey(b64)).toThrow();
   });
 
   it("低熵口令被拒绝", () => {
@@ -249,6 +271,10 @@ describe("crypto.js MASTER_KEY 强度（P1-2）", () => {
   it("31 / 33 字节 hex 被拒绝", () => {
     expect(() => decodeMasterKey("01".repeat(31))).toThrow();
     expect(() => decodeMasterKey("01".repeat(33))).toThrow();
+  });
+
+  it("非 hex 字符被拒绝", () => {
+    expect(() => decodeMasterKey("zz".repeat(32))).toThrow();
   });
 
   it("AES-GCM 加解密往返成功且随机 IV", () => {
@@ -269,6 +295,13 @@ describe("crypto.js MASTER_KEY 强度（P1-2）", () => {
     badIv[0] ^= 0xff;
     expect(() => decrypt({ iv: badIv.toString("base64"), data: ct.data })).toThrow();
   });
+
+  it("篡改 GCM tag（末尾 16 字节）解密失败", () => {
+    const ct = encrypt("secret-payload");
+    const buf = Buffer.from(ct.data, "base64");
+    buf[buf.length - 1] ^= 0xff;
+    expect(() => decrypt({ iv: ct.iv, data: buf.toString("base64") })).toThrow();
+  });
 });
 
 describe("auth.js verifyPassword malformed hash（P2-1）", () => {
@@ -285,5 +318,11 @@ describe("auth.js verifyPassword malformed hash（P2-1）", () => {
     expect(verifyPassword("x", "a:b:c")).toBe(false);
     expect(verifyPassword("x", "")).toBe(false);
     expect(verifyPassword("x", "deadbeef:0123456789abcdef")).toBe(false);
+  });
+
+  it("salt 长度错误（非 16 字节）安全返回 false", () => {
+    const shortSalt = "ab".repeat(8); // 8 字节
+    const hash64 = "ab".repeat(64); // 64 字节
+    expect(verifyPassword("x", `${shortSalt}:${hash64}`)).toBe(false);
   });
 });

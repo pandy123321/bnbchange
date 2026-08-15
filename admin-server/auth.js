@@ -26,14 +26,14 @@ export function verifyPassword(password, stored) {
   try {
     const parts = String(stored ?? "").split(":");
     if (parts.length !== 2) return false;
-    // 严格校验格式：salt 非空合法 hex、hash 恰好 64 字节，
+    // 严格校验格式：salt 恰好 16 字节、hash 恰好 64 字节，且均为合法 hex，
     // 避免 malformed hash 触发 timingSafeEqual 长度不匹配抛异常（500）。
     const salt = Buffer.from(parts[0], "hex");
     const hash = Buffer.from(parts[1], "hex");
     if (
       !/^[0-9a-fA-F]+$/.test(parts[0]) ||
       !/^[0-9a-fA-F]+$/.test(parts[1]) ||
-      salt.length === 0 ||
+      salt.length !== 16 ||
       hash.length !== 64
     ) {
       return false;

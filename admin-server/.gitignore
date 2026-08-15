@@ -3,6 +3,7 @@ master.key
 MASTER_KEY
 .env
 .env.*
+!.env.example
 
 # 运行时数据
 users.json
