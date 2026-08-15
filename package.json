@@ -45,6 +45,12 @@
       "electron/**",
       "package.json"
     ],
+    "extraResources": [
+      {
+        "from": ".env.production",
+        "to": "env.production"
+      }
+    ],
     "win": {
       "target": [
         "nsis"

@@ -56,7 +56,7 @@ cd license-server
 node server.js   # 默认监听 127.0.0.1:8788（如需改端口/监听地址，用 LICENSE_PORT / LICENSE_HOST 环境变量）
 ```
 
-> 公网部署：Node 进程默认只监听 `127.0.0.1`，不直接裸露公网。请用 Nginx / Caddy / 负载均衡提供 HTTPS，再反向代理到 `127.0.0.1:8788`。同时通过 `LICENSE_ALLOWED_ORIGINS` 显式配置允许的前端 Origin（逗号分隔），禁止使用 `*`。
+> 部署：Node 进程默认只监听 `127.0.0.1`。可用 Nginx / Caddy 反向代理到 `127.0.0.1:8788`；内部测试可直接用 HTTP，生产环境再上 HTTPS。同时通过 `LICENSE_ALLOWED_ORIGINS` 显式配置允许的前端 Origin（逗号分隔），禁止使用 `*`。
 >
 > 反向代理需把真实客户端 IP 转发给后端（`X-Forwarded-For`），否则限流会按代理自身 IP 统一计数、误伤所有用户。后端仅在请求来自可信代理（默认本机 loopback，可用 `LICENSE_TRUSTED_PROXIES` 追加）时才解析 `X-Forwarded-For`，并按「可信代理链」从右向左取第一个不可信 IP 作为真实客户端；即使客户端自行伪造 `X-Forwarded-For`，也无法改变限流所用的真实客户端 IP。直接公网访问 Node 时伪造 `X-Forwarded-For` 不会生效。
 >
@@ -75,7 +75,7 @@ node cli.js revoke XXXX-XXXX-XXXX-XXXX         # 吊销
 打包前，在项目根目录创建 `.env.production`：
 
 ```env
-VITE_LICENSE_API_BASE_URL=https://你的服务器域名或IP
+VITE_LICENSE_API_BASE_URL=http://你的服务器域名或IP   # 内部测试用 http；生产环境建议 https
 ```
 
 > 注意：`VITE_` 开头的变量会在 `vite build` 时被**编译进产物**。改地址后必须重新 `npm run build` / `npm run dist`。

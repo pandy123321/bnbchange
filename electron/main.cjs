@@ -1,12 +1,46 @@
 const { app, BrowserWindow, shell, ipcMain, dialog } = require("electron");
 const http = require("node:http");
 const { readFile } = require("node:fs/promises");
+const { existsSync, readFileSync } = require("node:fs");
 const { extname, join, normalize } = require("node:path");
+
+// 读取构建时固化的 .env（零依赖解析）：优先 .env.production，其次 .env。
+// 仅当 process.env 未显式设置时才回填，保证运行时环境变量优先级最高。
+// 打包后：electron-builder 会把 .env.production 复制为 resources/env.production
+//   （electron-builder 默认忽略 .env* 隐藏文件，故用 extraResources 复制为非隐藏名，见 package.json）。
+// 开发时：直接读项目根目录的 .env.production / .env。
+function loadDotEnv() {
+  const candidates = [
+    join(process.resourcesPath ?? "", "env.production"),
+    join(__dirname, "..", ".env.production"),
+    join(__dirname, "..", ".env"),
+  ];
+  for (const file of candidates) {
+    if (!file || !existsSync(file)) continue;
+    const raw = readFileSync(file, "utf8");
+    for (const line of raw.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const eq = trimmed.indexOf("=");
+      if (eq < 0) continue;
+      const key = trimmed.slice(0, eq).trim();
+      let value = trimmed.slice(eq + 1).trim();
+      if (
+        (value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))
+      ) {
+        value = value.slice(1, -1);
+      }
+      if (key && process.env[key] === undefined) process.env[key] = value;
+    }
+  }
+}
+loadDotEnv();
 
 const DIST = join(__dirname, "..", "dist");
 // 前端静态页面固定端口，保证浏览器 localStorage 的 origin 稳定（授权记住有效）
 const APP_PORT = Number(process.env.APP_PORT) || 4173;
-// 授权服务器地址（本地测试默认 8788；远程部署时用 LICENSE_SERVER_URL 覆盖）
+// 授权服务器地址（本地测试默认 8788；远程部署时用 .env.production 里的 LICENSE_SERVER_URL 或运行时环境变量覆盖）
 const LICENSE_SERVER_URL =
   process.env.LICENSE_SERVER_URL || "http://127.0.0.1:8788";
 
