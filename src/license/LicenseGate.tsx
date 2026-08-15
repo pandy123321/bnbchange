@@ -1,7 +1,11 @@
 import { useState } from "react";
 import { verifyLicense } from "./licenseApi";
 
-export function LicenseGate({ onVerified }: { onVerified: () => void }) {
+export function LicenseGate({
+  onVerified,
+}: {
+  onVerified: (expiresAt: number | null) => void;
+}) {
   const [code, setCode] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
@@ -18,7 +22,7 @@ export function LicenseGate({ onVerified }: { onVerified: () => void }) {
     try {
       const res = await verifyLicense(code);
       if (res.ok) {
-        onVerified();
+        onVerified(res.expiresAt ?? null);
       } else {
         setError(res.error ?? "授权码无效或不可用");
       }
@@ -33,7 +37,7 @@ export function LicenseGate({ onVerified }: { onVerified: () => void }) {
     <div className="min-h-screen flex items-center justify-center bg-gray-950 text-gray-100">
       <div className="w-full max-w-sm p-8 rounded-xl bg-gray-900 border border-gray-800 shadow-xl">
         <h1 className="text-xl font-semibold text-center mb-1">
-          BSC Batch &amp; Copy Trade Tool
+          BSC 批量转账与跟单工具
         </h1>
         <p className="text-center text-xs text-gray-500 mb-6">仅限内部授权使用</p>
 
@@ -54,7 +58,7 @@ export function LicenseGate({ onVerified }: { onVerified: () => void }) {
           disabled={loading}
           className="w-full py-2 rounded-md bg-blue-600 hover:bg-blue-500 disabled:opacity-50 font-medium"
         >
-          {loading ? "验证中..." : "Verify"}
+          {loading ? "验证中..." : "验证"}
         </button>
       </div>
     </div>

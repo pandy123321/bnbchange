@@ -1,8 +1,13 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ethers } from "ethers";
 import type { NetworkConfig } from "../config/networks";
-import type { CopyTradeResult, FollowerConfig } from "../types";
+import type {
+  CopyTradeResult,
+  FollowerConfig,
+  SignerWallet,
+} from "../types";
 import { createWallet, getWalletBalance } from "../wallet/wallet";
+import { connectMetaMask, onMetaMaskChange } from "../wallet/metamask";
 import {
   estimateBuyGasCost,
   getTokenMetadata,
@@ -48,7 +53,7 @@ async function buildFollowers(
     .filter(Boolean);
 
   if (lines.length === 0) {
-    throw new Error("请至少导入一个 Follower 私钥");
+    throw new Error("请至少导入一个跟单钱包私钥");
   }
 
   const defaultWei = ethers.parseEther(defaultAmountText || "0");
@@ -59,7 +64,7 @@ async function buildFollowers(
     const balanceWei = await getWalletBalance(w.address, provider);
     followers.push({
       id: `follower-${i}`,
-      name: `Follower ${i + 1}`,
+      name: `跟单 ${i + 1}`,
       address: w.address,
       privateKey: lines[i],
       balanceWei,
@@ -82,8 +87,11 @@ export function CopyTrade({
   rpcReady: boolean;
   onExecutingChange: (executing: boolean) => void;
 }) {
+  const [leaderMode, setLeaderMode] = useState<"privateKey" | "metamask">(
+    "privateKey"
+  );
   const [leaderPrivateKey, setLeaderPrivateKey] = useState("");
-  const [leaderWallet, setLeaderWallet] = useState<ethers.Wallet | null>(null);
+  const [leaderWallet, setLeaderWallet] = useState<SignerWallet | null>(null);
   const [leaderBalanceWei, setLeaderBalanceWei] = useState<bigint | null>(null);
   const [leaderAmountText, setLeaderAmountText] = useState("");
 
@@ -101,10 +109,51 @@ export function CopyTrade({
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const executionRef = useRef(false);
+  const metaSubRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    return () => metaSubRef.current?.();
+  }, []);
 
   function handleLeaderPrivateKeyChange(value: string) {
     setLeaderPrivateKey(value);
     // 源输入变化 → 旧 leader wallet / 余额立即失效
+    setLeaderWallet(null);
+    setLeaderBalanceWei(null);
+  }
+
+  function switchLeaderMode(mode: "privateKey" | "metamask") {
+    if (isExecuting) return;
+    setLeaderMode(mode);
+    // 模式切换 → 旧 leader wallet / 余额立即失效
+    setLeaderWallet(null);
+    setLeaderBalanceWei(null);
+    metaSubRef.current?.();
+    metaSubRef.current = null;
+    setError("");
+  }
+
+  async function connectMeta() {
+    setError("");
+    setLeaderWallet(null);
+    setLeaderBalanceWei(null);
+    try {
+      const session = await connectMetaMask(network);
+      setLeaderWallet(session.signer);
+      setLeaderBalanceWei(await getWalletBalance(session.address, provider));
+      metaSubRef.current?.();
+      metaSubRef.current = onMetaMaskChange(() => {
+        setLeaderWallet(null);
+        setLeaderBalanceWei(null);
+      });
+    } catch (e) {
+      setError(safeErrorMessage(e));
+    }
+  }
+
+  function disconnectMeta() {
+    metaSubRef.current?.();
+    metaSubRef.current = null;
     setLeaderWallet(null);
     setLeaderBalanceWei(null);
   }
@@ -154,7 +203,7 @@ export function CopyTrade({
         provider
       );
       setFollowers(list);
-      setMessage(`已导入 ${list.length} 个 Follower`);
+      setMessage(`已导入 ${list.length} 个跟单钱包`);
     } catch (e) {
       setError(safeErrorMessage(e));
     }
@@ -167,7 +216,7 @@ export function CopyTrade({
     try {
       const meta = await getTokenMetadata(tokenAddress, provider);
       setTokenMeta(meta);
-      setMessage(`Token: ${meta.symbol} (${meta.name})`);
+      setMessage(`代币: ${meta.symbol} (${meta.name})`);
     } catch (e) {
       setError(safeErrorMessage(e));
     }
@@ -196,30 +245,30 @@ export function CopyTrade({
 
     let leaderWei = 0n;
     try {
-      if (!leaderWallet) throw new Error("请先导入 Leader Private Key");
-      if (leaderAmountText.trim() === "") throw new Error("请填写 Leader Buy Amount");
+      if (!leaderWallet) throw new Error("请先连接带单钱包（输入私钥或连接小狐狸）");
+      if (leaderAmountText.trim() === "") throw new Error("请填写带单买入金额");
       leaderWei = ethers.parseEther(leaderAmountText);
-      if (leaderWei <= 0n) throw new Error("Leader Buy Amount 必须大于 0");
-      messages.push(`Leader 买入 ${leaderAmountText} ${network.nativeSymbol}`);
+      if (leaderWei <= 0n) throw new Error("带单买入金额必须大于 0");
+      messages.push(`带单买入 ${leaderAmountText} ${network.nativeSymbol}`);
     } catch (e) {
       problems.push(safeErrorMessage(e));
     }
 
     if (followers.length === 0) {
-      problems.push("请先 Parse Followers");
+      problems.push("请先解析跟单钱包");
     } else {
       for (const f of followers) {
         if (f.buyAmountWei <= 0n) {
           problems.push(`${f.name} 买入金额必须大于 0`);
         }
       }
-      messages.push(`${followers.length} 个 Follower`);
+      messages.push(`${followers.length} 个跟单钱包`);
     }
 
     let tokenOk = false;
     try {
-      if (!tokenMeta) throw new Error("请先读取 Token 信息");
-      messages.push(`Token ${tokenMeta.symbol}`);
+      if (!tokenMeta) throw new Error("请先读取代币信息");
+      messages.push(`代币 ${tokenMeta.symbol}`);
       tokenOk = true;
     } catch (e) {
       problems.push(safeErrorMessage(e));
@@ -246,7 +295,7 @@ export function CopyTrade({
           supportFeeOnTransfer
         );
       } catch {
-        problems.push("无法估算 Leader 交易 Gas（报价/流动性异常），已阻止执行");
+        problems.push("无法估算带单交易 Gas（报价/流动性异常），已阻止执行");
         leaderGasCost = 0n;
       }
     }
@@ -257,13 +306,13 @@ export function CopyTrade({
         const bal = await getWalletBalance(leaderWallet.address, provider);
         if (bal < leaderWei + leaderGasCost) {
           problems.push(
-            `Leader BNB 余额不足（需 ${ethers.formatEther(leaderWei + leaderGasCost)}，当前 ${ethers.formatEther(bal)}）`
+            `带单钱包余额不足（需 ${ethers.formatEther(leaderWei + leaderGasCost)} ${network.nativeSymbol}，当前 ${ethers.formatEther(bal)} ${network.nativeSymbol}）`
           );
         } else {
-          messages.push(`Leader 余额充足`);
+          messages.push(`带单钱包余额充足`);
         }
       } catch (e) {
-        problems.push(`Leader 余额检查失败：${safeErrorMessage(e)}`);
+        problems.push(`带单钱包余额检查失败：${safeErrorMessage(e)}`);
       }
     }
 
@@ -283,7 +332,7 @@ export function CopyTrade({
           const bal = await getWalletBalance(f.address, provider);
           if (bal < f.buyAmountWei + followerGasCost) {
             problems.push(
-              `${f.name} BNB 余额不足（需 ${ethers.formatEther(f.buyAmountWei + followerGasCost)}，当前 ${ethers.formatEther(bal)}）`
+              `${f.name} ${network.nativeSymbol} 余额不足（需 ${ethers.formatEther(f.buyAmountWei + followerGasCost)}，当前 ${ethers.formatEther(bal)}）`
             );
           }
         } catch (e) {
@@ -329,7 +378,7 @@ export function CopyTrade({
 
       const leader: CopyTradeWallet = {
         role: "leader",
-        name: "Leader",
+        name: "带单",
         wallet: leaderWallet!,
         amountWei: leaderWei,
         amountText: leaderAmountText,
@@ -344,7 +393,7 @@ export function CopyTrade({
       }));
 
       const initial: CopyTradeResult[] = [
-        { role: "leader", name: "Leader", address: leaderWallet!.address, buyAmount: leaderAmountText, status: "processing" },
+        { role: "leader", name: "带单", address: leaderWallet!.address, buyAmount: leaderAmountText, status: "processing" },
         ...followerWallets.map((f) => ({
           role: "follower" as const,
           name: f.name,
@@ -388,33 +437,82 @@ export function CopyTrade({
   return (
     <div className="space-y-6">
       <section className="rounded-xl border border-gray-800 bg-gray-900 p-5">
-        <h2 className="font-semibold mb-3">Leader</h2>
+        <h2 className="font-semibold mb-3">带单钱包</h2>
+
+        <div className="inline-flex rounded-lg bg-gray-800 border border-gray-700 p-1 mb-4">
+          <button
+            onClick={() => switchLeaderMode("privateKey")}
+            disabled={isExecuting}
+            className={`px-3 py-1.5 rounded-md text-sm ${
+              leaderMode === "privateKey"
+                ? "bg-gray-600 text-white"
+                : "text-gray-400 hover:text-gray-200"
+            } disabled:opacity-50`}
+          >
+            输入私钥
+          </button>
+          <button
+            onClick={() => switchLeaderMode("metamask")}
+            disabled={isExecuting}
+            className={`px-3 py-1.5 rounded-md text-sm ${
+              leaderMode === "metamask"
+                ? "bg-gray-600 text-white"
+                : "text-gray-400 hover:text-gray-200"
+            } disabled:opacity-50`}
+          >
+            连接小狐狸
+          </button>
+        </div>
+
         <div className="grid md:grid-cols-2 gap-4">
           <div>
-            <label className="block text-xs text-gray-400 mb-1">Private Key</label>
-            <div className="flex gap-2">
-              <input
-                type="password"
-                value={leaderPrivateKey}
-                onChange={(e) => handleLeaderPrivateKeyChange(e.target.value)}
-                disabled={isExecuting}
-                placeholder="0x..."
-                className="flex-1 px-3 py-2 rounded-md bg-gray-800 border border-gray-700 font-mono focus:outline-none focus:border-blue-500 disabled:opacity-50"
-              />
-              <button
-                onClick={loadLeader}
-                disabled={isExecuting || !rpcReady}
-                className="px-4 py-2 rounded-md bg-gray-700 hover:bg-gray-600 disabled:opacity-50"
-              >
-                读取
-              </button>
-            </div>
+            {leaderMode === "privateKey" ? (
+              <>
+                <label className="block text-xs text-gray-400 mb-1">私钥</label>
+                <div className="flex gap-2">
+                  <input
+                    type="password"
+                    value={leaderPrivateKey}
+                    onChange={(e) => handleLeaderPrivateKeyChange(e.target.value)}
+                    disabled={isExecuting}
+                    placeholder="0x..."
+                    className="flex-1 px-3 py-2 rounded-md bg-gray-800 border border-gray-700 font-mono focus:outline-none focus:border-blue-500 disabled:opacity-50"
+                  />
+                  <button
+                    onClick={loadLeader}
+                    disabled={isExecuting || !rpcReady}
+                    className="px-4 py-2 rounded-md bg-gray-700 hover:bg-gray-600 disabled:opacity-50"
+                  >
+                    读取
+                  </button>
+                </div>
+              </>
+            ) : (
+              <div className="flex gap-2">
+                <button
+                  onClick={connectMeta}
+                  disabled={isExecuting || !rpcReady}
+                  className="px-4 py-2 rounded-md bg-orange-600 hover:bg-orange-500 disabled:opacity-50 font-medium"
+                >
+                  连接小狐狸
+                </button>
+                {leaderWallet && (
+                  <button
+                    onClick={disconnectMeta}
+                    disabled={isExecuting}
+                    className="px-4 py-2 rounded-md bg-gray-700 hover:bg-gray-600 disabled:opacity-50"
+                  >
+                    断开
+                  </button>
+                )}
+              </div>
+            )}
             {leaderWallet && (
               <div className="mt-2 text-xs space-y-1">
                 <div className="font-mono break-all text-gray-300">{leaderWallet.address}</div>
                 {leaderBalanceWei != null && (
                   <div className="text-gray-400">
-                    Balance:{" "}
+                    余额:{" "}
                     <span className="text-gray-100">
                       {ethers.formatEther(leaderBalanceWei)} {network.nativeSymbol}
                     </span>
@@ -424,7 +522,7 @@ export function CopyTrade({
             )}
           </div>
           <div>
-            <label className="block text-xs text-gray-400 mb-1">Leader Buy ({network.nativeSymbol})</label>
+            <label className="block text-xs text-gray-400 mb-1">带单买入金额 ({network.nativeSymbol})</label>
             <input
               type="text"
               value={leaderAmountText}
@@ -438,10 +536,10 @@ export function CopyTrade({
       </section>
 
       <section className="rounded-xl border border-gray-800 bg-gray-900 p-5">
-        <h2 className="font-semibold mb-3">Followers</h2>
+        <h2 className="font-semibold mb-3">跟单钱包</h2>
         <div className="grid md:grid-cols-2 gap-4">
           <div>
-            <label className="block text-xs text-gray-400 mb-1">Private Keys（每行一个）</label>
+            <label className="block text-xs text-gray-400 mb-1">私钥（每行一个）</label>
             <textarea
               value={followersText}
               onChange={(e) => handleFollowersTextChange(e.target.value)}
@@ -452,7 +550,7 @@ export function CopyTrade({
             />
           </div>
           <div>
-            <label className="block text-xs text-gray-400 mb-1">Default Buy ({network.nativeSymbol})</label>
+            <label className="block text-xs text-gray-400 mb-1">默认买入金额 ({network.nativeSymbol})</label>
             <input
               type="text"
               value={defaultAmountText}
@@ -466,7 +564,7 @@ export function CopyTrade({
               disabled={isExecuting || !rpcReady}
               className="mt-3 px-4 py-2 rounded-md bg-gray-700 hover:bg-gray-600 disabled:opacity-50"
             >
-              Parse Followers
+              解析跟单钱包
             </button>
           </div>
         </div>
@@ -477,9 +575,9 @@ export function CopyTrade({
               <thead>
                 <tr className="text-left text-gray-400 border-b border-gray-800">
                   <th className="py-2 pr-4">#</th>
-                  <th className="py-2 pr-4">Address</th>
-                  <th className="py-2 pr-4">Balance</th>
-                  <th className="py-2">Buy</th>
+                  <th className="py-2 pr-4">地址</th>
+                  <th className="py-2 pr-4">余额</th>
+                  <th className="py-2">买入</th>
                 </tr>
               </thead>
               <tbody>
@@ -511,7 +609,7 @@ export function CopyTrade({
         <h2 className="font-semibold mb-3">交易参数</h2>
         <div className="grid md:grid-cols-3 gap-4">
           <div>
-            <label className="block text-xs text-gray-400 mb-1">Token Address</label>
+            <label className="block text-xs text-gray-400 mb-1">代币地址</label>
             <div className="flex gap-2">
               <input
                 type="text"
@@ -536,7 +634,7 @@ export function CopyTrade({
             )}
           </div>
           <div>
-            <label className="block text-xs text-gray-400 mb-1">Slippage %</label>
+            <label className="block text-xs text-gray-400 mb-1">滑点 (%)</label>
             <input
               type="text"
               value={slippageText}
@@ -554,7 +652,7 @@ export function CopyTrade({
                 disabled={isExecuting}
                 className="accent-blue-600"
               />
-              Fee-on-Transfer 兼容模式
+              含税代币兼容模式
             </label>
           </div>
         </div>
@@ -565,14 +663,14 @@ export function CopyTrade({
             disabled={isExecuting}
             className="px-4 py-2 rounded-md bg-gray-700 hover:bg-gray-600 disabled:opacity-50"
           >
-            Validate
+            校验
           </button>
           <button
             onClick={start}
             disabled={isExecuting || !rpcReady}
             className="px-4 py-2 rounded-md bg-blue-600 hover:bg-blue-500 disabled:opacity-50 font-medium"
           >
-            {isExecuting ? "执行中..." : "Start Copy Trade"}
+            {isExecuting ? "执行中..." : "开始跟单"}
           </button>
         </div>
 
@@ -601,11 +699,11 @@ export function CopyTrade({
             <table className="w-full text-sm">
               <thead>
                 <tr className="text-left text-gray-400 border-b border-gray-800">
-                  <th className="py-2 pr-4">Role</th>
-                  <th className="py-2 pr-4">Address</th>
-                  <th className="py-2 pr-4">Buy</th>
-                  <th className="py-2 pr-4">Status</th>
-                  <th className="py-2">TX</th>
+                  <th className="py-2 pr-4">角色</th>
+                  <th className="py-2 pr-4">地址</th>
+                  <th className="py-2 pr-4">买入</th>
+                  <th className="py-2 pr-4">状态</th>
+                  <th className="py-2">交易</th>
                 </tr>
               </thead>
               <tbody>
@@ -625,7 +723,7 @@ export function CopyTrade({
                           rel="noreferrer"
                           className="text-blue-400 hover:underline"
                         >
-                          View
+                          查看
                         </a>
                       ) : r.error ? (
                         <span className="text-red-400 text-xs">{r.error}</span>
@@ -648,7 +746,7 @@ export function CopyTrade({
             onClick={() => exportCopyTradeCsv(results)}
             className="mt-4 px-4 py-2 rounded-md bg-gray-700 hover:bg-gray-600 text-sm"
           >
-            Export CSV
+            导出 CSV
           </button>
         </section>
       )}

@@ -2,12 +2,17 @@
   "name": "bnb-batch-copytrade",
   "private": true,
   "version": "0.1.0",
+  "description": "BSC 批量转账与跟单工具",
+  "author": "bnbchange",
   "type": "module",
+  "main": "electron/main.cjs",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "electron": "electron .",
+    "dist": "npm run build && electron-builder --win"
   },
   "dependencies": {
     "ethers": "^6.17.0",
@@ -19,8 +24,35 @@
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
     "@vitejs/plugin-react": "^6.0.5",
+    "electron": "^33.4.11",
+    "electron-builder": "^25.1.8",
     "tailwindcss": "^4.3.3",
     "typescript": "^7.0.2",
     "vite": "^8.2.1"
+  },
+  "build": {
+    "appId": "com.bnbtool.batch",
+    "productName": "BSC批量转账与跟单工具",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**",
+      "electron/**",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "BSC批量转账与跟单工具"
+    }
   }
 }

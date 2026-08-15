@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'"
+    />
+    <title>授权验证</title>
+    <style>
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      body {
+        font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+        background: #030712;
+        color: #e5e7eb;
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+      }
+      .box {
+        width: 100%;
+        max-width: 380px;
+        background: #111827;
+        border: 1px solid #1f2937;
+        border-radius: 12px;
+        padding: 28px;
+        box-shadow: 0 20px 50px rgba(0, 0, 0, 0.4);
+      }
+      h1 { font-size: 18px; text-align: center; margin-bottom: 6px; }
+      .sub { text-align: center; font-size: 12px; color: #6b7280; margin-bottom: 22px; }
+      input {
+        width: 100%;
+        padding: 10px 12px;
+        background: #1f2937;
+        border: 1px solid #374151;
+        border-radius: 8px;
+        color: #e5e7eb;
+        font-family: Consolas, monospace;
+        font-size: 15px;
+        text-align: center;
+        letter-spacing: 2px;
+        outline: none;
+      }
+      input:focus { border-color: #3b82f6; }
+      #error { color: #f87171; font-size: 13px; text-align: center; margin-top: 12px; min-height: 18px; }
+      #ok { color: #4ade80; font-size: 13px; text-align: center; margin-top: 12px; min-height: 18px; }
+      button {
+        width: 100%;
+        padding: 10px;
+        margin-top: 16px;
+        background: #2563eb;
+        color: #fff;
+        border: none;
+        border-radius: 8px;
+        font-size: 15px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      button:hover { background: #1d4ed8; }
+      button:disabled { opacity: 0.5; cursor: not-allowed; }
+      .hint { font-size: 11px; color: #4b5563; text-align: center; margin-top: 16px; line-height: 1.6; }
+    </style>
+  </head>
+  <body>
+    <div class="box">
+      <h1>BSC 批量转账与跟单工具</h1>
+      <p class="sub">仅限内部授权使用</p>
+      <input id="code" placeholder="XXXX-XXXX-XXXX-XXXX" autocomplete="off" spellcheck="false" />
+      <p id="error"></p>
+      <p id="ok"></p>
+      <button id="btn">验证并打开</button>
+      <p class="hint">
+        验证通过后将自动打开系统浏览器进入操作界面。<br />
+        浏览器内可使用小狐狸（MetaMask）钱包。
+      </p>
+    </div>
+
+    <script>
+      const input = document.getElementById("code");
+      const btn = document.getElementById("btn");
+      const errEl = document.getElementById("error");
+      const okEl = document.getElementById("ok");
+
+      input.addEventListener("input", () => {
+        input.value = input.value.toUpperCase();
+      });
+
+      async function submit() {
+        const code = input.value.trim();
+        errEl.textContent = "";
+        okEl.textContent = "";
+        if (!code) {
+          errEl.textContent = "请输入授权码";
+          return;
+        }
+        btn.disabled = true;
+        btn.textContent = "验证中...";
+        try {
+          const res = await window.desktop.verifyLicense(code);
+          if (res.ok) {
+            btn.textContent = "已打开浏览器";
+            okEl.textContent = "授权通过，浏览器已打开，可关闭此窗口";
+          } else {
+            btn.textContent = "验证并打开";
+            btn.disabled = false;
+            errEl.textContent = res.error || "授权码无效或不可用";
+          }
+        } catch (e) {
+          btn.textContent = "验证并打开";
+          btn.disabled = false;
+          errEl.textContent = "无法连接授权服务器";
+        }
+      }
+
+      btn.addEventListener("click", submit);
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") submit();
+      });
+      input.focus();
+    </script>
+  </body>
+</html>

@@ -1,17 +1,19 @@
-import { ethers } from "ethers";
-import type { TransferRecipient, TransferResult } from "../types";
+import type { NetworkConfig, TokenConfig } from "../config/networks";
+import type { SignerWallet, TransferRecipient, TransferResult } from "../types";
 import { assertExpectedChain } from "../utils/chain";
 import { isConfirmedRevert, safeErrorMessage } from "../utils/error";
+import { sendTransfer } from "./token";
 
 export async function runBatchTransfer(
-  wallet: ethers.Wallet,
+  wallet: SignerWallet,
+  token: TokenConfig,
   recipients: TransferRecipient[],
-  expectedChainId: number,
+  network: NetworkConfig,
   onUpdate: (index: number, result: TransferResult) => void
 ): Promise<void> {
   // 资金执行层自校验：广播前再次核验实际 Chain ID（Fail Closed）
   try {
-    await assertExpectedChain(wallet.provider!, expectedChainId);
+    await assertExpectedChain(wallet.provider!, network.chainId);
   } catch (error) {
     for (let i = 0; i < recipients.length; i++) {
       onUpdate(i, {
@@ -36,10 +38,12 @@ export async function runBatchTransfer(
     let txHash: string | undefined;
 
     try {
-      const tx = await wallet.sendTransaction({
-        to: recipient.address,
-        value: recipient.amountWei,
-      });
+      const tx = await sendTransfer(
+        wallet,
+        token,
+        recipient.address,
+        recipient.amountWei
+      );
 
       txHash = tx.hash;
 
@@ -65,7 +69,7 @@ export async function runBatchTransfer(
           amount: recipient.amountText,
           status: "failed",
           txHash,
-          error: "Transaction reverted",
+          error: "交易已回滚",
         });
       }
     } catch (error) {

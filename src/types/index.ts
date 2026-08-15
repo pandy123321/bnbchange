@@ -1,4 +1,15 @@
-export type NetworkKey = "bsc-mainnet" | "bsc-testnet";
+import type { JsonRpcSigner, Wallet } from "ethers";
+
+export type SignerWallet = Wallet | JsonRpcSigner;
+
+export type NetworkKey =
+  | "bsc-mainnet"
+  | "bsc-testnet"
+  | "eth-mainnet"
+  | "polygon-mainnet"
+  | "arbitrum-mainnet"
+  | "optimism-mainnet"
+  | "base-mainnet";
 
 export interface WalletRuntime {
   id: string;

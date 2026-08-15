@@ -2,9 +2,10 @@ import { ethers } from "ethers";
 
 const PATTERNS: Array<[RegExp, string]> = [
   [/insufficient funds/i, "BNB 余额不足"],
-  [/invalid private key/i, "Private Key 无效"],
+  [/invalid private key/i, "私钥无效"],
   [/invalid address|bad address checksum|invalid checksum/i, "地址格式错误"],
   [/execution reverted|\breverted\b/i, "交易执行失败"],
+  [/missing revert data/i, "交易预估失败：余额不足，或收款地址为合约且无接收函数"],
   [/INSUFFICIENT_OUTPUT_AMOUNT|getAmountsOut|no liquidity|quote/i, "无法获取报价，可能无直接流动性"],
   [/timeout|timed out|network error/i, "RPC 请求失败，请人工检查链上状态"],
   [/nonce too low|nonce has already been used/i, "Nonce 冲突，请稍后重试"],

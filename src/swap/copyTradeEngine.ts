@@ -1,12 +1,11 @@
-import type { Wallet } from "ethers";
 import type { NetworkConfig } from "../config/networks";
-import type { CopyTradeResult } from "../types";
+import type { CopyTradeResult, SignerWallet } from "../types";
 import { buyToken } from "./pancake";
 
 export interface CopyTradeWallet {
   role: "leader" | "follower";
   name: string;
-  wallet: Wallet;
+  wallet: SignerWallet;
   amountWei: bigint;
   amountText: string;
 }
@@ -56,8 +55,8 @@ export async function runCopyTrade(
   if (leaderRes.status !== "success") {
     const reason =
       leaderRes.status === "unknown"
-        ? "Leader 交易已广播但状态未确认，Followers 未执行"
-        : "Leader 买入失败，Followers 未执行";
+        ? "带单交易已广播但状态未确认，跟单钱包未执行"
+        : "带单买入失败，跟单钱包未执行";
 
     for (let i = 0; i < config.followers.length; i++) {
       const follower = config.followers[i];

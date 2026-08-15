@@ -1,6 +1,6 @@
 import { ethers } from "ethers";
 import type { NetworkConfig } from "../config/networks";
-import type { SimpleTxStatus } from "../types";
+import type { SignerWallet, SimpleTxStatus } from "../types";
 import { assertExpectedChain } from "../utils/chain";
 import { isConfirmedRevert, safeErrorMessage } from "../utils/error";
 import { ERC20_MIN_ABI, PANCAKE_ROUTER_V2_ABI } from "./abi";
@@ -13,7 +13,7 @@ export interface TokenMetadata {
 }
 
 export interface BuyParams {
-  wallet: ethers.Wallet;
+  wallet: SignerWallet;
   tokenAddress: string;
   amountInWei: bigint;
   slippageBps: bigint;
@@ -30,8 +30,11 @@ export interface BuyResult {
 
 export function getRouter(
   network: NetworkConfig,
-  wallet: ethers.Wallet
+  wallet: SignerWallet
 ): ethers.Contract {
+  if (!network.routerAddress) {
+    throw new Error("当前网络不支持 PancakeSwap 跟单");
+  }
   return new ethers.Contract(
     network.routerAddress,
     PANCAKE_ROUTER_V2_ABI,
@@ -116,7 +119,7 @@ export async function buyToken(params: BuyParams): Promise<BuyResult> {
       hash,
       status: "failed",
       amountOutMin,
-      error: "Transaction reverted",
+      error: "交易已回滚",
     };
   } catch (error) {
     // 已广播但 receipt 无法确认 → unknown，保留 txHash；
@@ -136,7 +139,7 @@ export async function buyToken(params: BuyParams): Promise<BuyResult> {
 }
 
 export async function estimateBuyGasCost(
-  wallet: ethers.Wallet,
+  wallet: SignerWallet,
   network: NetworkConfig,
   tokenAddress: string,
   amountInWei: bigint,
@@ -169,7 +172,10 @@ export async function estimateBuyGasCost(
         { value: amountInWei }
       );
 
-  const provider = wallet.provider as ethers.JsonRpcProvider;
+  const provider = wallet.provider;
+  if (!provider) {
+    throw new Error("钱包未连接 Provider");
+  }
   const feeData = await provider.getFeeData();
   const gasPrice =
     feeData.gasPrice ?? feeData.maxFeePerGas ?? 1_000_000_000n;

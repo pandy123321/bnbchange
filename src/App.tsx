@@ -1,12 +1,39 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { ethers } from "ethers";
 import { NETWORKS } from "./config/networks";
 import type { NetworkKey } from "./types";
 import { LicenseGate } from "./license/LicenseGate";
+import { verifySession } from "./license/licenseApi";
 import { BatchTransfer } from "./transfer/BatchTransfer";
 import { CopyTrade } from "./swap/CopyTrade";
+import { pickProvider } from "./utils/rpc";
 
 type Tab = "transfer" | "copytrade";
+
+const LICENSE_STORAGE_KEY = "bnb_tool_license";
+
+function readStoredLicense(): boolean {
+  try {
+    const raw = localStorage.getItem(LICENSE_STORAGE_KEY);
+    if (!raw) return false;
+    if (raw === "permanent") return true;
+    const expiresAt = Number(raw);
+    return Number.isFinite(expiresAt) && expiresAt > Date.now();
+  } catch {
+    return false;
+  }
+}
+
+function storeLicense(expiresAt: number | null): void {
+  try {
+    localStorage.setItem(
+      LICENSE_STORAGE_KEY,
+      expiresAt == null ? "permanent" : String(expiresAt)
+    );
+  } catch {
+    // 忽略存储失败（隐私模式等）
+  }
+}
 
 function TabButton({
   active,
@@ -35,11 +62,15 @@ function TabButton({
 }
 
 export default function App() {
-  // 仅用于本地冒烟测试的环境变量开关；默认不绕过授权门禁
-  const licenseBypass = import.meta.env.VITE_BYPASS_LICENSE === "1";
-  const [verified, setVerified] = useState(licenseBypass);
+  // 仅用于本地冒烟测试的环境变量开关；默认不绕过授权门禁。
+  // 强制绑定开发环境：生产构建（npm run build / dist）下 DEV 恒为 false，无法绕过授权。
+  const licenseBypass =
+    import.meta.env.DEV && import.meta.env.VITE_BYPASS_LICENSE === "1";
+  const [verified, setVerified] = useState(licenseBypass || readStoredLicense());
+  const [checkingSession, setCheckingSession] = useState(false);
   const [networkKey, setNetworkKey] = useState<NetworkKey>("bsc-testnet");
   const [tab, setTab] = useState<Tab>("transfer");
+  const [provider, setProvider] = useState<ethers.JsonRpcProvider | null>(null);
   const [rpcError, setRpcError] = useState("");
   const [rpcReady, setRpcReady] = useState(false);
   const [blockNumber, setBlockNumber] = useState<number | null>(null);
@@ -47,67 +78,106 @@ export default function App() {
 
   const network = NETWORKS[networkKey];
 
-  const provider = useMemo(
-    () => new ethers.JsonRpcProvider(network.rpcUrl),
-    [network.rpcUrl]
-  );
+  // 桌面端验证授权码后，会用系统浏览器打开带 ?session=<token> 的地址；
+  // 这里消费该一次性 token 换取“已验证”状态，避免在浏览器里二次输入授权码。
+  useEffect(() => {
+    if (verified || licenseBypass) return;
+    const token = new URLSearchParams(window.location.search).get("session");
+    if (!token) return;
+
+    setCheckingSession(true);
+    verifySession(token)
+      .then((res) => {
+        if (res.ok) {
+          storeLicense(res.expiresAt ?? null);
+          setVerified(true);
+        }
+      })
+      .catch(() => {
+        // 忽略，回退到手动输入授权码
+      })
+      .finally(() => {
+        setCheckingSession(false);
+        const url = new URL(window.location.href);
+        url.searchParams.delete("session");
+        window.history.replaceState({}, "", url);
+      });
+  }, [verified, licenseBypass]);
 
   useEffect(() => {
     let cancelled = false;
     setRpcError("");
     setRpcReady(false);
     setBlockNumber(null);
+    setProvider(null);
 
-    provider
-      .getNetwork()
-      .then((n) => {
-        if (cancelled) return null;
-        if (Number(n.chainId) !== network.chainId) {
-          setRpcError(
-            `RPC 网络不一致（期望 ${network.chainId}，实际 ${Number(n.chainId)}）`
-          );
-          return null;
-        }
-        return provider.getBlockNumber();
-      })
-      .then((block) => {
-        if (cancelled || block == null) return;
-        setBlockNumber(block);
+    pickProvider(network.rpcUrls, network.chainId)
+      .then(async ({ provider: p }) => {
+        if (cancelled) return;
+        setProvider(p);
         setRpcReady(true);
+        const block = await p.getBlockNumber();
+        if (!cancelled) setBlockNumber(block);
       })
-      .catch(() => {
-        if (!cancelled) setRpcError("无法连接 RPC，请检查网络配置");
+      .catch((e) => {
+        if (cancelled) return;
+        setRpcError(
+          e instanceof Error ? e.message : "无法连接 RPC，请检查网络配置"
+        );
       });
 
     return () => {
       cancelled = true;
     };
-  }, [provider, network.chainId]);
+  }, [network]);
 
   if (!verified) {
-    return <LicenseGate onVerified={() => setVerified(true)} />;
+    if (checkingSession) {
+      return (
+        <div className="min-h-screen flex items-center justify-center bg-gray-950 text-gray-100">
+          <p className="text-sm text-gray-400">正在验证授权...</p>
+        </div>
+      );
+    }
+    return (
+      <LicenseGate
+        onVerified={(expiresAt) => {
+          storeLicense(expiresAt);
+          setVerified(true);
+        }}
+      />
+    );
   }
 
   return (
     <div className="min-h-screen bg-gray-950 text-gray-100">
       <header className="border-b border-gray-800 bg-gray-900">
         <div className="max-w-5xl mx-auto px-4 py-3 flex flex-wrap items-center gap-3 justify-between">
-          <h1 className="font-semibold">BSC Batch &amp; Copy Trade Tool</h1>
+          <h1 className="font-semibold">BSC 批量转账与跟单工具</h1>
           <div className="flex items-center gap-3 text-sm">
             <select
               value={networkKey}
-              onChange={(e) => setNetworkKey(e.target.value as NetworkKey)}
+              onChange={(e) => {
+                const key = e.target.value as NetworkKey;
+                setNetworkKey(key);
+                if (!NETWORKS[key].routerAddress && tab === "copytrade") {
+                  setTab("transfer");
+                }
+              }}
               disabled={isExecuting}
               className="bg-gray-800 border border-gray-700 rounded px-2 py-1 disabled:opacity-50"
             >
-              <option value="bsc-testnet">BSC Testnet</option>
-              <option value="bsc-mainnet">BSC Mainnet</option>
+              {Object.entries(NETWORKS).map(([key, n]) => (
+                <option key={key} value={key}>
+                  {n.name}
+                </option>
+              ))}
             </select>
-            <span className="text-green-400">License ✓</span>
+            <span className="text-green-400">授权 ✓</span>
             {rpcError ? (
               <span className="text-red-400">{rpcError}</span>
             ) : rpcReady && blockNumber != null ? (
-              <span className="text-gray-400">Block #{blockNumber}</span>
+              <span className="text-gray-400">区块 #{blockNumber}</span>
             ) : (
               <span className="text-gray-500">连接中...</span>
             )}
@@ -124,38 +194,51 @@ export default function App() {
           <TabButton
             active={tab === "copytrade"}
             onClick={() => setTab("copytrade")}
-            disabled={isExecuting}
+            disabled={isExecuting || !network.routerAddress}
           >
             带单跟单
           </TabButton>
+          {!network.routerAddress && (
+            <span className="ml-2 self-center text-xs text-gray-500">
+              跟单仅支持 BSC（PancakeSwap）
+            </span>
+          )}
         </div>
       </header>
 
       {!rpcReady && (
         <div className="max-w-5xl mx-auto px-4 pt-4">
           <div className="rounded-lg border border-red-800 bg-red-900/20 px-4 py-2 text-sm text-red-300">
-            RPC 网络未就绪，所有资金操作已锁定（Fail Closed）。
+            {rpcError
+              ? `RPC 网络不可用：${rpcError}`
+              : "正在连接 RPC 网络..."}
           </div>
         </div>
       )}
 
       <main className="max-w-5xl mx-auto px-4 py-6">
-        {tab === "transfer" ? (
-          <BatchTransfer
-            key={network.key}
-            network={network}
-            provider={provider}
-            rpcReady={rpcReady}
-            onExecutingChange={setIsExecuting}
-          />
+        {provider ? (
+          tab === "transfer" ? (
+            <BatchTransfer
+              key={network.key}
+              network={network}
+              provider={provider}
+              rpcReady={rpcReady}
+              onExecutingChange={setIsExecuting}
+            />
+          ) : (
+            <CopyTrade
+              key={network.key}
+              network={network}
+              provider={provider}
+              rpcReady={rpcReady}
+              onExecutingChange={setIsExecuting}
+            />
+          )
         ) : (
-          <CopyTrade
-            key={network.key}
-            network={network}
-            provider={provider}
-            rpcReady={rpcReady}
-            onExecutingChange={setIsExecuting}
-          />
+          <div className="text-center text-gray-500 py-16">
+            {rpcError ? "RPC 网络不可用，请稍后重试" : "正在连接 RPC 网络..."}
+          </div>
         )}
       </main>
     </div>

@@ -19,7 +19,7 @@ export function createWallet(
   try {
     return new ethers.Wallet(normalized, provider);
   } catch {
-    throw new Error("Private Key 无效");
+    throw new Error("私钥无效");
   }
 }
 

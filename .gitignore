@@ -1,7 +1,10 @@
 node_modules
 dist
+release
 .env
 .env.local
+.env.production
 *.log
 .DS_Store
 .project-ai/
+license-server/licenses.json

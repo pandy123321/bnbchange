@@ -1,0 +1,10 @@
+{
+  "name": "bnbchange-license-server",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "BSC 工具的最小授权码后台（只读验证 + 本地卡密管理）",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
