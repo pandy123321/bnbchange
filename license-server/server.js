@@ -1,5 +1,6 @@
 import http from "node:http";
 import { randomBytes } from "node:crypto";
+import { isIP } from "node:net";
 import { loadLicenses, normalizeCode } from "./store.js";
 
 const PORT = Number(process.env.LICENSE_PORT ?? 8788);
@@ -49,18 +50,40 @@ function corsHeaders(origin) {
 }
 
 // 安全获取客户端 IP：
-// 只有 socket 对端来自可信代理（默认本机 loopback）时才读取 X-Forwarded-For，
-// 否则一律使用 socket 地址，防止直接公网访问时伪造 XFF 绕过限流。
+// 1. 连接不来自可信代理 → 完全忽略 XFF，直接用 socket 地址（防伪造绕过限流）。
+// 2. 连接来自可信代理 → 从右向左解析代理链：
+//    - 跳过可信代理节点；
+//    - 遇到第一个「不可信的合法 IP」即真实客户端；
+//    - 出现非法 token 或没有合法客户端 IP → Fail Closed 回退 socketIp。
 function getClientIp(req) {
   const socketIp = req.socket.remoteAddress ?? "unknown";
-  if (TRUSTED_PROXIES.has(socketIp)) {
-    const xff = req.headers["x-forwarded-for"];
-    if (typeof xff === "string") {
-      // 代理链格式 "client, proxy1, proxy2" → 取最左侧原始客户端 IP
-      const first = xff.split(",")[0].trim();
-      if (first) return first;
-    }
+
+  if (!TRUSTED_PROXIES.has(socketIp)) {
+    return socketIp;
   }
+
+  const xff = req.headers["x-forwarded-for"];
+  if (typeof xff !== "string" || !xff.trim()) {
+    return socketIp;
+  }
+
+  const tokens = xff
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  for (let i = tokens.length - 1; i >= 0; i--) {
+    const token = tokens[i];
+    // 非法 token → 代理链不可信，Fail Closed 回退
+    if (isIP(token) === 0) {
+      return socketIp;
+    }
+    if (TRUSTED_PROXIES.has(token)) {
+      continue; // 可信代理 → 继续向左
+    }
+    return token; // 第一个不可信的合法 IP = 真实客户端
+  }
+
   return socketIp;
 }
 

@@ -58,7 +58,7 @@ node server.js   # 默认监听 127.0.0.1:8788（如需改端口/监听地址，
 
 > 公网部署：Node 进程默认只监听 `127.0.0.1`，不直接裸露公网。请用 Nginx / Caddy / 负载均衡提供 HTTPS，再反向代理到 `127.0.0.1:8788`。同时通过 `LICENSE_ALLOWED_ORIGINS` 显式配置允许的前端 Origin（逗号分隔），禁止使用 `*`。
 >
-> 反向代理需把真实客户端 IP 转发给后端（如 `X-Forwarded-For`），否则限流会按代理自身 IP 统一计数、误伤所有用户。后端仅在请求来自可信代理（默认本机 loopback，可用 `LICENSE_TRUSTED_PROXIES` 追加）时才读取 `X-Forwarded-For`；直接公网访问 Node 时伪造 `X-Forwarded-For` 不会生效。
+> 反向代理需把真实客户端 IP 转发给后端（`X-Forwarded-For`），否则限流会按代理自身 IP 统一计数、误伤所有用户。后端仅在请求来自可信代理（默认本机 loopback，可用 `LICENSE_TRUSTED_PROXIES` 追加）时才解析 `X-Forwarded-For`，并按「可信代理链」从右向左取第一个不可信 IP 作为真实客户端；即使客户端自行伪造 `X-Forwarded-For`，也无法改变限流所用的真实客户端 IP。直接公网访问 Node 时伪造 `X-Forwarded-For` 不会生效。
 >
 > 确需 Node 直接监听公网时再显式设置 `LICENSE_HOST=0.0.0.0`，并自行配置防火墙 / HTTPS / CORS 等边界。
 
