@@ -131,6 +131,10 @@ async function buildFollowers(
 
 // 自动跟单信号 FIFO 队列安全上限；超过则 Fail Closed（停止监听 + 人工处理）
 const MAX_SIGNAL_QUEUE = 50;
+// exactly-once 去重保留窗口（块数）：远大于 monitor MAX_SCAN_BEHIND=20，覆盖任何可能的重扫窗口
+const KEEP_BLOCK_WINDOW = 1000;
+// 去重容器软上限：达到后触发过期淘汰，保证内存有界
+const DEDUPE_PRUNE_THRESHOLD = 10_000;
 
 export function CopyTrade({
   network,
@@ -181,10 +185,16 @@ export function CopyTrade({
   const queueLimitReachedRef = useRef(false);
   // 自动执行 Fail Closed 标记：monitor 停止/队列溢出/用户停止后，禁止继续消费 pending 队列
   const autoHaltedRef = useRef(false);
-  // 全生命周期 txHash exactly-once 去重（最后资金防线）：覆盖 queued + executing + completed
-  const acceptedSignalHashesRef = useRef<Set<string>>(new Set());
+  // 全生命周期 txHash exactly-once 去重（最后资金防线）：覆盖 queued + executing + completed。
+  // Map<txHash, blockNumber> 有界存储：仅淘汰已远离重扫窗口且非 active 的历史项。
+  const acceptedSignalHashesRef = useRef<Map<string, number>>(new Map());
+  // 当前 queued/executing 中的 txHash：这些绝不被去重淘汰
+  const activeSignalHashesRef = useRef<Set<string>>(new Set());
   // 防止 startMonitor 重入（快速双击创建两个监听器）
   const monitorStartingRef = useRef(false);
+  // 组件生命周期 + 启动代际：防止异步 startMonitor 在组件卸载后创建孤儿 Monitor
+  const mountedRef = useRef(true);
+  const monitorGenerationRef = useRef(0);
   // latest-value refs：监听回调跨异步读取时始终拿到最新配置，避免闭包陈旧
   const followersRef = useRef(followers);
   followersRef.current = followers;
@@ -194,13 +204,17 @@ export function CopyTrade({
   supportFotRef.current = supportFeeOnTransfer;
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
       metaSubRef.current?.();
       // 组件卸载（含网络切换导致的 remount）时停止监听
+      mountedRef.current = false;
+      monitorGenerationRef.current++;
       monitorRef.current?.stop();
       monitorRef.current = null;
       queueRef.current = [];
       queueProcessingRef.current = false;
+      activeSignalHashesRef.current.clear();
       autoHaltedRef.current = true;
     };
   }, []);
@@ -646,11 +660,24 @@ export function CopyTrade({
     });
   }
 
+  // 淘汰已远离重扫窗口且非 active 的历史去重项，保证内存有界且不破坏 exactly-once
+  function pruneAccepted(currentBlock: number) {
+    const m = acceptedSignalHashesRef.current;
+    if (m.size < DEDUPE_PRUNE_THRESHOLD) return;
+    const threshold = currentBlock - KEEP_BLOCK_WINDOW;
+    for (const [hash, block] of m) {
+      if (block < threshold && !activeSignalHashesRef.current.has(hash)) {
+        m.delete(hash);
+      }
+    }
+  }
+
   // 将尚未执行的 pending 信号标记为 cancelled（停止/溢出/Fail Closed 时调用）
   function markPendingCancelled(reason: string) {
     const pending = queueRef.current;
     queueRef.current = [];
     for (const s of pending) {
+      activeSignalHashesRef.current.delete(s.txHash);
       upsertSignalLog({
         txHash: s.txHash,
         direction: s.direction,
@@ -672,7 +699,8 @@ export function CopyTrade({
   function handleSignal(signal: TradeSignal) {
     // 全生命周期 exactly-once 去重（最后资金防线）：覆盖 queued + executing + completed
     if (acceptedSignalHashesRef.current.has(signal.txHash)) return;
-    acceptedSignalHashesRef.current.add(signal.txHash);
+    acceptedSignalHashesRef.current.set(signal.txHash, signal.blockNumber);
+    pruneAccepted(signal.blockNumber);
 
     upsertSignalLog({
       txHash: signal.txHash,
@@ -702,6 +730,7 @@ export function CopyTrade({
     }
 
     queueRef.current.push(signal);
+    activeSignalHashesRef.current.add(signal.txHash);
     void drainQueue();
   }
 
@@ -734,6 +763,7 @@ export function CopyTrade({
             await followSell(signal);
           }
         } finally {
+          activeSignalHashesRef.current.delete(signal.txHash);
           executionRef.current = false;
           setIsExecuting(false);
           onExecutingChange(false);
@@ -934,8 +964,15 @@ export function CopyTrade({
     if (monitorRef.current || monitorStartingRef.current) return;
     monitorStartingRef.current = true;
     setMonitorStarting(true);
+    // 启动窗口内锁定父级 network/tab 切换，作为 UX 防线（代码层 guard 才是资金安全保证）
+    onExecutingChange(true);
     setError("");
     setMessage("");
+
+    // 启动代际：异步窗口后校验组件仍挂载且未被重新启动
+    const generation = ++monitorGenerationRef.current;
+    const isStartStillValid = () =>
+      mountedRef.current && generation === monitorGenerationRef.current;
 
     try {
       if (!rpcReady) {
@@ -965,6 +1002,9 @@ export function CopyTrade({
       );
       const wbnb = (await router.WETH()) as string;
 
+      // 异步窗口后：组件可能已卸载或重新启动，失效则放弃，绝不创建孤儿 Monitor
+      if (!isStartStillValid()) return;
+
       const monitor = startTradeMonitor({
         provider,
         leaderAddress: leaderWallet.address,
@@ -982,6 +1022,12 @@ export function CopyTrade({
         },
       });
 
+      // 临界点后再校验：若已失效，立即 stop 创建的 monitor，不写入已卸载组件
+      if (!isStartStillValid()) {
+        monitor.stop();
+        return;
+      }
+
       monitorRef.current = monitor;
       queueLimitReachedRef.current = false;
       autoHaltedRef.current = false;
@@ -994,6 +1040,7 @@ export function CopyTrade({
     } finally {
       monitorStartingRef.current = false;
       setMonitorStarting(false);
+      onExecutingChange(false);
     }
   }
 
