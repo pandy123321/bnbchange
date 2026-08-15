@@ -440,6 +440,11 @@ export function CopyTrade({
       // 买入成功后记录跟单持仓（仅 Follower，Leader 持仓由带单方自行管理）
       for (const r of finalResults) {
         if (r.role !== "follower" || r.status !== "success") continue;
+        const received = r.receivedAmountWei ?? 0n;
+        if (received <= 0n) {
+          // 到账量异常，不创建正常持仓（由结果表展示 accountingWarning）
+          continue;
+        }
         const fw = followerWallets.find(
           (f) => f.wallet.address.toLowerCase() === r.address.toLowerCase()
         );
@@ -449,7 +454,7 @@ export function CopyTrade({
           tokenMeta!.address,
           tokenMeta!.symbol,
           tokenMeta!.decimals,
-          r.receivedAmountWei ?? 0n,
+          received,
           fw?.amountWei ?? 0n,
           r.txHash
         );
@@ -852,6 +857,11 @@ export function CopyTrade({
                       {r.status === "unknown" && r.txHash && (
                         <span className="block text-xs text-orange-300 mt-1">
                           已广播但状态未确认，请先通过 txHash 检查链上结果，勿重复发送
+                        </span>
+                      )}
+                      {r.accountingWarning && (
+                        <span className="block text-xs text-yellow-300 mt-1">
+                          {r.accountingWarning}
                         </span>
                       )}
                     </td>

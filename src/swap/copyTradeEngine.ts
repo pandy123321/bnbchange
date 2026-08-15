@@ -54,6 +54,7 @@ export async function runCopyTrade(
     txHash: leaderRes.hash,
     error: leaderRes.error,
     receivedAmountWei: leaderRes.receivedAmountWei,
+    accountingWarning: leaderRes.accountingWarning,
   };
   results[0] = leaderResult;
   onUpdate(0, leaderResult);
@@ -114,6 +115,7 @@ export async function runCopyTrade(
       txHash: res.hash,
       error: res.error,
       receivedAmountWei: res.receivedAmountWei,
+      accountingWarning: res.accountingWarning,
     };
     results[index] = fr;
     onUpdate(index, fr);
