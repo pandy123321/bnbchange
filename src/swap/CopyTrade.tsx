@@ -11,9 +11,17 @@ import { connectMetaMask, onMetaMaskChange } from "../wallet/metamask";
 import {
   estimateBuyGasCost,
   getTokenMetadata,
+  sellToken,
   type TokenMetadata,
 } from "./pancake";
 import { runCopyTrade, type CopyTradeWallet } from "./copyTradeEngine";
+import {
+  getPosition,
+  listPositions,
+  reducePosition,
+  upsertPosition,
+  type Position,
+} from "./position";
 import { exportCopyTradeCsv } from "../utils/csv";
 import { txExplorerUrl } from "../utils/explorer";
 import { safeErrorMessage } from "../utils/error";
@@ -105,6 +113,8 @@ export function CopyTrade({
   const [supportFeeOnTransfer, setSupportFeeOnTransfer] = useState(false);
 
   const [results, setResults] = useState<CopyTradeResult[]>([]);
+  const [positions, setPositions] = useState<Position[]>([]);
+  const [sellPct, setSellPct] = useState<Record<string, string>>({});
   const [isExecuting, setIsExecuting] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
@@ -404,7 +414,7 @@ export function CopyTrade({
       ];
       setResults(initial);
 
-      await runCopyTrade(
+      const finalResults = await runCopyTrade(
         {
           tokenAddress: tokenMeta!.address,
           slippageBps,
@@ -421,6 +431,98 @@ export function CopyTrade({
           });
         }
       );
+
+      // 买入成功后记录跟单持仓（仅 Follower，Leader 持仓由带单方自行管理）
+      for (const r of finalResults) {
+        if (r.role !== "follower" || r.status !== "success") continue;
+        const fw = followerWallets.find(
+          (f) => f.wallet.address.toLowerCase() === r.address.toLowerCase()
+        );
+        upsertPosition(
+          r.address,
+          tokenMeta!.address,
+          tokenMeta!.symbol,
+          tokenMeta!.decimals,
+          r.expectedOutWei ?? 0n,
+          fw?.amountWei ?? 0n,
+          r.txHash
+        );
+      }
+      setPositions(listPositions());
+    } catch (e) {
+      setError(safeErrorMessage(e));
+    } finally {
+      executionRef.current = false;
+      setIsExecuting(false);
+      onExecutingChange(false);
+    }
+  }
+
+  function posKey(p: Position): string {
+    return `${p.follower.toLowerCase()}:${p.tokenAddress.toLowerCase()}`;
+  }
+
+  async function sellPosition(pos: Position, percentText: string) {
+    if (executionRef.current) return;
+
+    const follower = followers.find(
+      (f) => f.address.toLowerCase() === pos.follower.toLowerCase()
+    );
+    if (!follower) {
+      setError("未找到该持仓对应的跟单钱包私钥，请先重新解析跟单钱包");
+      return;
+    }
+
+    const pct = Number(percentText);
+    if (!Number.isFinite(pct) || pct <= 0 || pct > 100) {
+      setError("卖出比例必须在 0 ~ 100 之间");
+      return;
+    }
+
+    const sellWei = (pos.amountWei * BigInt(Math.round(pct * 100))) / 10_000n;
+    if (sellWei <= 0n) {
+      setError("卖出数量为 0，请调整卖出比例");
+      return;
+    }
+
+    // 无持仓 / 超卖拦截
+    const current = getPosition(pos.follower, pos.tokenAddress);
+    if (!current || current.amountWei < sellWei) {
+      setError("持仓不足，已取消卖出");
+      setPositions(listPositions());
+      return;
+    }
+
+    executionRef.current = true;
+    setIsExecuting(true);
+    onExecutingChange(true);
+    setError("");
+    setMessage("");
+
+    try {
+      const slippageBps = slippagePercentToBps(slippageText);
+      const wallet = createWallet(follower.privateKey, provider);
+      const res = await sellToken({
+        wallet,
+        tokenAddress: pos.tokenAddress,
+        amountInWei: sellWei,
+        slippageBps,
+        network,
+        supportFeeOnTransfer,
+      });
+
+      if (res.status === "success") {
+        reducePosition(pos.follower, pos.tokenAddress, sellWei);
+        setPositions(listPositions());
+        setMessage(`已卖出 ${pos.tokenSymbol}${res.hash ? " · " + res.hash.slice(0, 10) + "..." : ""}`);
+      } else if (res.status === "unknown") {
+        // 已广播但未确认：保留 txHash，不扣减持仓，提醒人工核对，避免重复卖出
+        setError(
+          `卖出已广播但状态未确认（${res.hash}），请先通过链上检查结果，勿重复卖出`
+        );
+      } else {
+        setError(res.error ?? "卖出失败");
+      }
     } catch (e) {
       setError(safeErrorMessage(e));
     } finally {
@@ -748,6 +850,71 @@ export function CopyTrade({
           >
             导出 CSV
           </button>
+        </section>
+      )}
+
+      {positions.length > 0 && (
+        <section className="rounded-xl border border-gray-800 bg-gray-900 p-5">
+          <h2 className="font-semibold mb-3">跟单持仓</h2>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-left text-gray-400 border-b border-gray-800">
+                  <th className="py-2 pr-4">地址</th>
+                  <th className="py-2 pr-4">代币</th>
+                  <th className="py-2 pr-4">数量</th>
+                  <th className="py-2 pr-4">成本 ({network.nativeSymbol})</th>
+                  <th className="py-2 pr-4">卖出比例</th>
+                  <th className="py-2">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {positions.map((p) => (
+                  <tr key={posKey(p)} className="border-b border-gray-800/50">
+                    <td className="py-2 pr-4 font-mono text-xs break-all">
+                      {p.follower}
+                    </td>
+                    <td className="py-2 pr-4">{p.tokenSymbol}</td>
+                    <td className="py-2 pr-4">
+                      {ethers.formatUnits(p.amountWei, p.decimals)}
+                    </td>
+                    <td className="py-2 pr-4">
+                      {ethers.formatEther(p.costBnbWei)}
+                    </td>
+                    <td className="py-2 pr-4">
+                      <input
+                        type="text"
+                        value={sellPct[posKey(p)] ?? "100"}
+                        onChange={(e) =>
+                          setSellPct((prev) => ({
+                            ...prev,
+                            [posKey(p)]: e.target.value,
+                          }))
+                        }
+                        disabled={isExecuting}
+                        className="w-16 px-2 py-1 rounded-md bg-gray-800 border border-gray-700 text-sm focus:outline-none focus:border-blue-500 disabled:opacity-50"
+                      />
+                      <span className="ml-1 text-gray-400">%</span>
+                    </td>
+                    <td className="py-2">
+                      <button
+                        onClick={() =>
+                          sellPosition(p, sellPct[posKey(p)] ?? "100")
+                        }
+                        disabled={isExecuting}
+                        className="px-3 py-1 rounded-md bg-red-600 hover:bg-red-500 disabled:opacity-50 text-sm"
+                      >
+                        卖出
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="mt-2 text-xs text-gray-500">
+            持仓为前端内存缓存；卖出比例 100% 即全部卖出，部分卖出按均价等比扣减成本。
+          </p>
         </section>
       )}
     </div>

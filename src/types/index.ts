@@ -59,4 +59,6 @@ export interface CopyTradeResult {
   status: SimpleTxStatus;
   txHash?: string;
   error?: string;
+  // 买入成功时代币的报价数量（用于持仓记账，含税代币为近似值）
+  expectedOutWei?: bigint;
 }
