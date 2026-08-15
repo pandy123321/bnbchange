@@ -20,6 +20,19 @@ const ALLOWED_ORIGINS = (
   .map((s) => s.trim())
   .filter(Boolean);
 
+// 可信反向代理来源：仅当 socket 对端来自这些地址时才信任 X-Forwarded-For。
+// 默认仅本机 loopback（同机 Nginx / Caddy / 负载均衡反向代理场景）；
+// 其它可信代理可通过 LICENSE_TRUSTED_PROXIES 追加（逗号分隔）。
+const TRUSTED_PROXIES = new Set([
+  "127.0.0.1",
+  "::1",
+  "::ffff:127.0.0.1",
+  ...(process.env.LICENSE_TRUSTED_PROXIES ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
+]);
+
 // 计算 CORS 响应头：
 // - 无 Origin（Electron 主进程 / 服务端请求）→ 空对象，不返回 CORS 头
 // - Origin 在白名单 → 返回该具体 Origin + Vary: Origin
@@ -33,6 +46,22 @@ function corsHeaders(origin) {
     };
   }
   return null;
+}
+
+// 安全获取客户端 IP：
+// 只有 socket 对端来自可信代理（默认本机 loopback）时才读取 X-Forwarded-For，
+// 否则一律使用 socket 地址，防止直接公网访问时伪造 XFF 绕过限流。
+function getClientIp(req) {
+  const socketIp = req.socket.remoteAddress ?? "unknown";
+  if (TRUSTED_PROXIES.has(socketIp)) {
+    const xff = req.headers["x-forwarded-for"];
+    if (typeof xff === "string") {
+      // 代理链格式 "client, proxy1, proxy2" → 取最左侧原始客户端 IP
+      const first = xff.split(",")[0].trim();
+      if (first) return first;
+    }
+  }
+  return socketIp;
 }
 
 function verify(code) {
@@ -102,6 +131,48 @@ function sendJson(res, status, body, extraHeaders = {}) {
   res.end(JSON.stringify(body));
 }
 
+// 统一 JSON body 读取：超过上限立即 413，且保证每个请求只响应一次。
+function readJsonBody(req, res, cors, onBody) {
+  let raw = "";
+  let size = 0;
+  let settled = false;
+
+  function respond(status, body, close = false) {
+    if (settled) return;
+    settled = true;
+    const headers = { ...cors };
+    if (close) headers.Connection = "close";
+    sendJson(res, status, body, headers);
+  }
+
+  req.on("data", (chunk) => {
+    if (settled) return;
+    size += chunk.length;
+    if (size > MAX_BODY_BYTES) {
+      // 立即返回 413，不再等待完整请求体；Connection: close 让服务端尽快释放连接
+      respond(413, { ok: false, error: "请求体过大" }, true);
+      return;
+    }
+    raw += chunk;
+  });
+
+  req.on("end", () => {
+    if (settled) return;
+    let parsed;
+    try {
+      parsed = JSON.parse(raw || "{}");
+    } catch {
+      respond(400, { ok: false, error: "请求格式错误" });
+      return;
+    }
+    onBody(parsed);
+  });
+
+  req.on("error", () => {
+    // 连接异常，无需额外处理
+  });
+}
+
 const server = http.createServer((req, res) => {
   const origin = req.headers.origin;
 
@@ -138,37 +209,13 @@ const server = http.createServer((req, res) => {
 
   const handler = routes[url.pathname];
   if (req.method === "POST" && handler) {
-    const ip = req.socket.remoteAddress ?? "unknown";
+    const ip = getClientIp(req);
     if (isRateLimited(ip)) {
       sendJson(res, 429, { ok: false, error: "请求过于频繁，请稍后再试" }, cors);
       return;
     }
 
-    let raw = "";
-    let size = 0;
-    let tooLarge = false;
-    req.on("data", (chunk) => {
-      size += chunk.length;
-      if (size > MAX_BODY_BYTES) {
-        tooLarge = true;
-        return; // 停止累计，避免超大请求占用内存
-      }
-      raw += chunk;
-    });
-    req.on("end", () => {
-      if (tooLarge) {
-        sendJson(res, 413, { ok: false, error: "请求体过大" }, cors);
-        return;
-      }
-
-      let parsed;
-      try {
-        parsed = JSON.parse(raw || "{}");
-      } catch {
-        sendJson(res, 400, { ok: false, error: "请求格式错误" }, cors);
-        return;
-      }
-
+    readJsonBody(req, res, cors, (parsed) => {
       try {
         const result = handler(parsed);
         sendJson(res, result.ok ? 200 : 403, result, cors);
