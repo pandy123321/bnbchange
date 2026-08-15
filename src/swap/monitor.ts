@@ -1,6 +1,12 @@
 // 单 Leader 链上监听：区块轮询扫描 Leader 发往 PancakeSwap Router 的交易，
 // 解码出买入/卖出信号，txHash 去重，回调上层执行跟单。
 // 监听与执行解耦，监听本身只读链上数据，不广播任何交易。
+//
+// 资金安全约束（Fail Closed）：
+// 1. 仅对 receipt.status === 1 的 Leader 交易生成信号（回滚交易绝不触发 Followers）。
+// 2. lastBlock 仅在区块完整成功扫描后才推进（RPC 异常不丢块，链读取重试允许）。
+// 3. 实际链 ID 与预期不一致时立即停止监听，不再产生信号。
+// 4. 落后超过安全窗口时不静默跳块，立即停止并提示人工核对。
 
 import { ethers } from "ethers";
 import type { TradeSignal } from "../types";
@@ -11,9 +17,12 @@ export interface TradeMonitorConfig {
   leaderAddress: string;
   routerAddress: string;
   wbnbAddress: string;
+  expectedChainId: number;
   pollIntervalMs?: number;
   onSignal: (signal: TradeSignal) => void;
   onError: (error: Error) => void;
+  // Fail Closed 时通知上层（monitor 已自行停止），用于 UI 同步监听状态
+  onStopped?: (reason: string) => void;
 }
 
 export interface TradeMonitor {
@@ -23,7 +32,7 @@ export interface TradeMonitor {
 
 // txHash 去重缓存上限；超出清空（极端情况下宁可丢历史去重也不无限增长）
 const MAX_TX_CACHE = 10_000;
-// 落后超过该块数时直接跳到最新块，避免追块风暴
+// 落后超过该块数时 Fail Closed，禁止静默跳块
 const MAX_SCAN_BEHIND = 20;
 
 export function startTradeMonitor(config: TradeMonitorConfig): TradeMonitor {
@@ -39,6 +48,30 @@ export function startTradeMonitor(config: TradeMonitorConfig): TradeMonitor {
   let initialized = false;
   let lastBlock = 0;
   let timer: ReturnType<typeof setInterval> | null = null;
+
+  // Fail Closed：致命错误仅触发一次，停止轮询并通知上层
+  function failClosed(reason: string): void {
+    if (stopped) return;
+    stopped = true;
+    if (timer) {
+      clearInterval(timer);
+      timer = null;
+    }
+    config.onStopped?.(reason);
+    config.onError(new Error(reason));
+  }
+
+  // 校验实际链 ID；不一致 → Fail Closed。RPC 临时失败则抛出，交由上层保持游标。
+  async function assertChain(): Promise<void> {
+    const net = await config.provider.getNetwork();
+    if (Number(net.chainId) !== config.expectedChainId) {
+      failClosed(
+        `监听 RPC 网络不一致（期望 ${config.expectedChainId}，实际 ${Number(
+          net.chainId
+        )}），已停止自动执行`
+      );
+    }
+  }
 
   // 只解码 Leader 发起到 Router 的 Swap；方向按 path 判定：
   // path[0] == WBNB → 买入（原生币换币）；path[末尾] == WBNB → 卖出（币换原生币）
@@ -99,16 +132,31 @@ export function startTradeMonitor(config: TradeMonitorConfig): TradeMonitor {
 
     for (const tx of block.prefetchedTransactions ?? []) {
       if (seenTx.has(tx.hash)) continue;
+
+      const signal = decode(tx);
+      if (!signal) {
+        // 非目标交易（非 Leader→Router Swap）：直接去重，避免反复 decode
+        seenTx.add(tx.hash);
+        if (seenTx.size > MAX_TX_CACHE) seenTx.clear();
+        continue;
+      }
+
+      // 仅对确认成功的 Leader 交易生成信号。
+      // receipt 读取失败会抛出 → tick catch 保持 lastBlock 不动，下一轮重扫本块；
+      // 因此这里必须在 receipt 成功获取后才写入 seenTx，避免失败时永久跳过该 tx。
+      const receipt = await config.provider.getTransactionReceipt(tx.hash);
       seenTx.add(tx.hash);
       if (seenTx.size > MAX_TX_CACHE) seenTx.clear();
 
-      const signal = decode(tx);
-      if (signal) {
-        try {
-          config.onSignal(signal);
-        } catch {
-          // 信号回调异常不影响监听循环继续
-        }
+      if (!receipt || receipt.status !== 1) {
+        // 回滚（status=0）或已不可见（重组）：绝不触发 Followers，且已标记去重
+        continue;
+      }
+
+      try {
+        config.onSignal(signal);
+      } catch {
+        // 信号回调异常不影响监听循环继续
       }
     }
   }
@@ -117,6 +165,9 @@ export function startTradeMonitor(config: TradeMonitorConfig): TradeMonitor {
     if (stopped || scanning) return;
     scanning = true;
     try {
+      await assertChain();
+      if (stopped) return;
+
       const current = await config.provider.getBlockNumber();
       if (!initialized) {
         initialized = true;
@@ -125,17 +176,25 @@ export function startTradeMonitor(config: TradeMonitorConfig): TradeMonitor {
       }
       if (current <= lastBlock) return;
 
-      let start = lastBlock + 1;
+      const start = lastBlock + 1;
       if (current - start > MAX_SCAN_BEHIND) {
-        start = current; // 追块过深直接跳到最新块
+        failClosed(
+          `监听落后超过 ${MAX_SCAN_BEHIND} 个区块，已停止自动执行，请人工核对期间带单交易后重新启动`
+        );
+        return;
       }
-      lastBlock = current;
 
       for (let b = start; b <= current; b++) {
         await scanBlock(b);
+        // checkpoint 仅在完整成功扫描 Block b 后推进；
+        // 若 b 失败，lastBlock 保持 b-1，下一轮从 b 重试（链读取重试，非资金交易重试）
+        lastBlock = b;
       }
     } catch (e) {
-      config.onError(e instanceof Error ? e : new Error(String(e)));
+      // RPC 临时错误：游标保持不变，下一轮从失败块重试，绝不前移导致永久丢块
+      if (!stopped) {
+        config.onError(e instanceof Error ? e : new Error(String(e)));
+      }
     } finally {
       scanning = false;
     }

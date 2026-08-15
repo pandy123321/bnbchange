@@ -5,6 +5,7 @@ import type {
   CopyTradeResult,
   FollowerConfig,
   SignerWallet,
+  SimpleTxStatus,
   TradeSignal,
 } from "../types";
 import { createWallet, getWalletBalance } from "../wallet/wallet";
@@ -34,13 +35,23 @@ import { exportCopyTradeCsv } from "../utils/csv";
 import { txExplorerUrl } from "../utils/explorer";
 import { safeErrorMessage } from "../utils/error";
 
+// 单个 Follower 在自动跟单中的执行结果，用于 Signal Log 展示 unknown txHash 供人工核查
+interface SignalFollowerResult {
+  name: string;
+  address: string;
+  status: SimpleTxStatus;
+  txHash?: string;
+  error?: string;
+}
+
 interface SignalLogEntry {
   txHash: string;
   direction: "buy" | "sell";
   tokenSymbol: string;
   amountText: string;
-  status: "detected" | "following" | "done" | "error";
+  status: "detected" | "following" | "done" | "attention" | "error";
   summary: string;
+  followers?: SignalFollowerResult[];
 }
 
 function SignalStatusBadge({ status }: { status: SignalLogEntry["status"] }) {
@@ -48,6 +59,7 @@ function SignalStatusBadge({ status }: { status: SignalLogEntry["status"] }) {
     detected: ["bg-blue-500/15 text-blue-300", "已检测"],
     following: ["bg-yellow-500/15 text-yellow-300", "跟单中"],
     done: ["bg-green-500/15 text-green-300", "完成"],
+    attention: ["bg-orange-500/15 text-orange-300", "待确认"],
     error: ["bg-red-500/15 text-red-300", "失败"],
   } as const;
   const [cls, label] = map[status];
@@ -116,6 +128,9 @@ async function buildFollowers(
   return followers;
 }
 
+// 自动跟单信号 FIFO 队列安全上限；超过则 Fail Closed（停止监听 + 人工处理）
+const MAX_SIGNAL_QUEUE = 50;
+
 export function CopyTrade({
   network,
   provider,
@@ -157,7 +172,11 @@ export function CopyTrade({
   const [monitoring, setMonitoring] = useState(false);
   const [signalLog, setSignalLog] = useState<SignalLogEntry[]>([]);
   const monitorRef = useRef<TradeMonitor | null>(null);
-  const autoExecRef = useRef(false);
+  // 单线程 FIFO 信号队列：busy → enqueue，不并发、不丢信号；
+  // 资金操作统一经过 executionRef / isExecuting / onExecutingChange 全局锁
+  const queueRef = useRef<TradeSignal[]>([]);
+  const queueProcessingRef = useRef(false);
+  const queueLimitReachedRef = useRef(false);
   // latest-value refs：监听回调跨异步读取时始终拿到最新配置，避免闭包陈旧
   const followersRef = useRef(followers);
   followersRef.current = followers;
@@ -172,6 +191,8 @@ export function CopyTrade({
       // 组件卸载（含网络切换导致的 remount）时停止监听
       monitorRef.current?.stop();
       monitorRef.current = null;
+      queueRef.current = [];
+      queueProcessingRef.current = false;
     };
   }, []);
 
@@ -623,25 +644,67 @@ export function CopyTrade({
       tokenSymbol: "",
       amountText: "",
       status: "detected",
-      summary: "",
+      summary: "已入队，等待执行",
     });
 
-    if (autoExecRef.current) {
-      upsertSignalLog({
-        txHash: signal.txHash,
-        direction: signal.direction,
-        tokenSymbol: "",
-        amountText: "",
-        status: "error",
-        summary: "上一次跟单尚未完成，已跳过本信号",
-      });
+    // 同 txHash 只入队一次（monitor 已去重，此处兜底）
+    if (queueRef.current.some((s) => s.txHash === signal.txHash)) return;
+
+    if (queueRef.current.length >= MAX_SIGNAL_QUEUE) {
+      // Fail Closed：队列溢出 → 停止监听，明确要求人工处理，不静默丢信号
+      if (!queueLimitReachedRef.current) {
+        queueLimitReachedRef.current = true;
+        stopMonitor();
+        upsertSignalLog({
+          txHash: signal.txHash,
+          direction: signal.direction,
+          tokenSymbol: "",
+          amountText: "",
+          status: "error",
+          summary: `信号队列已满（${MAX_SIGNAL_QUEUE}），已停止监听，请人工核对积压信号后重新启动`,
+        });
+      }
       return;
     }
 
-    autoExecRef.current = true;
-    void (signal.direction === "buy"
-      ? followBuy(signal)
-      : followSell(signal));
+    queueRef.current.push(signal);
+    void drainQueue();
+  }
+
+  // 单线程 FIFO 队列消费：严格顺序处理，不并发、不丢信号；
+  // 每个信号执行期间占用统一资金锁，Manual 与 Auto 互斥。
+  async function drainQueue() {
+    if (queueProcessingRef.current) return;
+    queueProcessingRef.current = true;
+    try {
+      while (queueRef.current.length > 0) {
+        // Manual 资金操作占用锁时等待，不丢弃信号
+        if (executionRef.current) {
+          await new Promise((r) => setTimeout(r, 400));
+          continue;
+        }
+
+        const signal = queueRef.current.shift()!;
+
+        // 统一资金执行锁（Manual Buy/Sell 与 Auto Buy/Sell 共用同一 gate）
+        executionRef.current = true;
+        setIsExecuting(true);
+        onExecutingChange(true);
+        try {
+          if (signal.direction === "buy") {
+            await followBuy(signal);
+          } else {
+            await followSell(signal);
+          }
+        } finally {
+          executionRef.current = false;
+          setIsExecuting(false);
+          onExecutingChange(false);
+        }
+      }
+    } finally {
+      queueProcessingRef.current = false;
+    }
   }
 
   async function followBuy(signal: TradeSignal) {
@@ -713,14 +776,29 @@ export function CopyTrade({
       }
       setPositions(listPositions(network.chainId));
 
+      const followerDetails: SignalFollowerResult[] = buyResults.map((r) => ({
+        name: r.name,
+        address: r.address,
+        status: r.status,
+        txHash: r.txHash,
+        error: r.error,
+      }));
       const ok = buyResults.filter((r) => r.status === "success").length;
+      const failed = buyResults.filter((r) => r.status === "failed").length;
+      const unknown = buyResults.filter((r) => r.status === "unknown").length;
+      const hasUnknown = unknown > 0;
+      const parts = [`成功 ${ok}`];
+      if (failed > 0) parts.push(`失败 ${failed}`);
+      if (unknown > 0) parts.push(`待确认 ${unknown}`);
+
       upsertSignalLog({
         txHash: signal.txHash,
         direction: "buy",
         tokenSymbol: meta.symbol,
         amountText: ethers.formatEther(signal.amountInWei),
-        status: "done",
-        summary: `跟单买入完成：成功 ${ok} / ${buyResults.length}`,
+        status: hasUnknown ? "attention" : "done",
+        summary: `跟单买入完成：${parts.join("，")}`,
+        followers: followerDetails,
       });
     } catch (e) {
       upsertSignalLog({
@@ -731,8 +809,6 @@ export function CopyTrade({
         status: "error",
         summary: safeErrorMessage(e),
       });
-    } finally {
-      autoExecRef.current = false;
     }
   }
 
@@ -777,10 +853,18 @@ export function CopyTrade({
       );
       setPositions(listPositions(network.chainId));
 
+      const followerDetails: SignalFollowerResult[] = sellResults.map((r) => ({
+        name: r.name,
+        address: r.address,
+        status: r.status,
+        txHash: r.txHash,
+        error: r.error,
+      }));
       const ok = sellResults.filter((r) => r.status === "success").length;
       const failed = sellResults.filter((r) => r.status === "failed").length;
       const skipped = sellResults.filter((r) => r.status === "skipped").length;
       const unknown = sellResults.filter((r) => r.status === "unknown").length;
+      const hasUnknown = unknown > 0;
 
       const parts = [`成功 ${ok}`];
       if (failed > 0) parts.push(`失败 ${failed}`);
@@ -792,8 +876,9 @@ export function CopyTrade({
         direction: "sell",
         tokenSymbol: symbol,
         amountText: "",
-        status: "done",
+        status: hasUnknown ? "attention" : "done",
         summary: `跟卖完成：${parts.join("，")}`,
+        followers: followerDetails,
       });
     } catch (e) {
       upsertSignalLog({
@@ -804,8 +889,6 @@ export function CopyTrade({
         status: "error",
         summary: safeErrorMessage(e),
       });
-    } finally {
-      autoExecRef.current = false;
     }
   }
 
@@ -846,11 +929,19 @@ export function CopyTrade({
         leaderAddress: leaderWallet.address,
         routerAddress: network.routerAddress,
         wbnbAddress: wbnb,
+        expectedChainId: network.chainId,
         onSignal: handleSignal,
         onError: (err) => setError(`监听异常：${safeErrorMessage(err)}`),
+        onStopped: (reason) => {
+          // Fail Closed：monitor 已自行停止，同步 UI 状态并展示原因
+          setMonitoring(false);
+          monitorRef.current = null;
+          setError(reason);
+        },
       });
 
       monitorRef.current = monitor;
+      queueLimitReachedRef.current = false;
       setMonitoring(true);
       setMessage(
         `已开始监听带单地址 ${leaderWallet.address.slice(0, 10)}...（区块轮询，4 秒/次）`
@@ -863,6 +954,9 @@ export function CopyTrade({
   function stopMonitor() {
     monitorRef.current?.stop();
     monitorRef.current = null;
+    // 用户主动停止：清空未处理信号队列；已广播的交易不会被强制取消（drainQueue 中正在 await 的
+    // 信号会自然执行完成，shift 已将其移出队列，清空不影响正在执行的交易）
+    queueRef.current = [];
     setMonitoring(false);
     setMessage("已停止监听");
   }
@@ -1176,6 +1270,33 @@ export function CopyTrade({
                     </td>
                     <td className="py-2 text-xs text-gray-400 break-all">
                       {e.summary}
+                      {e.followers?.some((f) => f.status === "unknown") && (
+                        <div className="mt-1 space-y-1">
+                          {e.followers
+                            .filter((f) => f.status === "unknown")
+                            .map((f, i) => (
+                              <div key={i} className="text-orange-300">
+                                {f.name} ·{" "}
+                                <span className="font-mono">{f.address}</span>
+                                {f.txHash ? (
+                                  <>
+                                    {" · "}
+                                    <a
+                                      href={txExplorerUrl(network, f.txHash)}
+                                      target="_blank"
+                                      rel="noreferrer"
+                                      className="text-blue-400 hover:underline font-mono"
+                                    >
+                                      {f.txHash.slice(0, 10)}…
+                                      {f.txHash.slice(-8)}
+                                    </a>
+                                  </>
+                                ) : null}
+                                {" · 已广播待确认，请链上核对，勿重复交易"}
+                              </div>
+                            ))}
+                        </div>
+                      )}
                     </td>
                   </tr>
                 ))}
