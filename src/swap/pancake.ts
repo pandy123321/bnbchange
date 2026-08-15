@@ -29,6 +29,8 @@ export interface BuyResult {
   expectedOut: bigint;
   // 买入确认后实际到账数量（balance delta），持仓记账 SoT，覆盖 FOT 代币
   receivedAmountWei: bigint;
+  // 广播前代币余额：unknown 状态下用于对账时计算实际到账量（可靠差值）
+  balanceBeforeWei: bigint;
   // 链上成功但到账量无法解析（0）时的结算告警，用于 UI 提示、禁止建仓
   accountingWarning?: string;
   error?: string;
@@ -84,6 +86,7 @@ export async function buyToken(params: BuyParams): Promise<BuyResult> {
   let amountOutMin = 0n;
   let expectedOut = 0n;
   let receivedAmountWei = 0n;
+  let balanceBeforeWei = 0n;
 
   try {
     // 广播前再次核验实际 Chain ID（Fail Closed）
@@ -99,9 +102,7 @@ export async function buyToken(params: BuyParams): Promise<BuyResult> {
       ERC20_MIN_ABI,
       params.wallet
     );
-    const balanceBefore = BigInt(
-      await token.balanceOf(params.wallet.address)
-    );
+    balanceBeforeWei = BigInt(await token.balanceOf(params.wallet.address));
 
     const amounts = await router.getAmountsOut(params.amountInWei, path);
     expectedOut = BigInt(amounts[1]);
@@ -141,7 +142,7 @@ export async function buyToken(params: BuyParams): Promise<BuyResult> {
           await token.balanceOf(params.wallet.address)
         );
         receivedAmountWei =
-          balanceAfter > balanceBefore ? balanceAfter - balanceBefore : 0n;
+          balanceAfter > balanceBeforeWei ? balanceAfter - balanceBeforeWei : 0n;
       } catch {
         return {
           hash,
@@ -149,6 +150,7 @@ export async function buyToken(params: BuyParams): Promise<BuyResult> {
           amountOutMin,
           expectedOut,
           receivedAmountWei: 0n,
+          balanceBeforeWei,
           accountingWarning:
             "买入已确认，但暂时无法读取实际到账量，请链上核对，未计入持仓",
         };
@@ -161,6 +163,7 @@ export async function buyToken(params: BuyParams): Promise<BuyResult> {
           amountOutMin,
           expectedOut,
           receivedAmountWei,
+          balanceBeforeWei,
           accountingWarning:
             "买入已确认，但实际到账量无法确定，请通过链上核对，未计入持仓",
         };
@@ -171,6 +174,7 @@ export async function buyToken(params: BuyParams): Promise<BuyResult> {
         amountOutMin,
         expectedOut,
         receivedAmountWei,
+        balanceBeforeWei,
       };
     }
 
@@ -180,6 +184,7 @@ export async function buyToken(params: BuyParams): Promise<BuyResult> {
       amountOutMin,
       expectedOut,
       receivedAmountWei,
+      balanceBeforeWei,
       error: "交易已回滚",
     };
   } catch (error) {
@@ -196,6 +201,7 @@ export async function buyToken(params: BuyParams): Promise<BuyResult> {
       amountOutMin,
       expectedOut,
       receivedAmountWei,
+      balanceBeforeWei,
       error: safeErrorMessage(error),
     };
   }

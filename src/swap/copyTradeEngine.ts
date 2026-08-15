@@ -55,6 +55,7 @@ export async function runCopyTrade(
     txHash: leaderRes.hash,
     error: leaderRes.error,
     receivedAmountWei: leaderRes.receivedAmountWei,
+    balanceBeforeWei: leaderRes.balanceBeforeWei,
     accountingWarning: leaderRes.accountingWarning,
   };
   results[0] = leaderResult;
@@ -126,6 +127,7 @@ export async function runCopyTrade(
       txHash: res.hash,
       error: res.error,
       receivedAmountWei: res.receivedAmountWei,
+      balanceBeforeWei: res.balanceBeforeWei,
       accountingWarning: res.accountingWarning,
     };
     results[index] = fr;
@@ -181,6 +183,7 @@ export async function runFollowersBuy(
       txHash: res.hash,
       error: res.error,
       receivedAmountWei: res.receivedAmountWei,
+      balanceBeforeWei: res.balanceBeforeWei,
       accountingWarning: res.accountingWarning,
     };
     results[i] = fr;

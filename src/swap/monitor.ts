@@ -8,6 +8,7 @@
 // 3. lastBlock 仅在区块完整成功扫描后才推进（RPC 异常不丢块，链读取重试允许）。
 // 4. 实际链 ID 与预期不一致时立即停止监听；RPC 连续失败达阈值时停止监听。
 // 5. 落后超过安全窗口时不静默跳块，立即停止并提示人工核对。
+// 6. 首次启动以 current block 为观察边界，只处理启动之后产生的新交易，不补扫历史交易。
 //
 // 注意：这里的 seenTx 去重是性能优化层，不是 exactly-once 的最终防线；
 // 执行层（CopyTrade）持有全生命周期 txHash 去重作为最后资金防线。
@@ -201,7 +202,11 @@ export function startTradeMonitor(config: TradeMonitorConfig): TradeMonitor {
       const safeHead = Math.max(0, current - confirmationDepth);
       if (!initialized) {
         initialized = true;
-        lastBlock = safeHead;
+        // 观察边界 = 启动时的 current block。只处理启动“之后”产生的新交易；
+        // 绝不补扫启动之前/启动时已存在、仍处于确认窗口内的历史交易，
+        // 避免组件 remount 后近期人工 Leader 交易被重复自动跟单。
+        // 启动后第一个新区块（current+1）仍须等满确认深度后才会被扫描。
+        lastBlock = current;
         consecutiveFailures = 0;
         return;
       }

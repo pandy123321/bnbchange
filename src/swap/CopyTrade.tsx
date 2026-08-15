@@ -23,7 +23,20 @@ import {
   type CopyTradeWallet,
 } from "./copyTradeEngine";
 import { startTradeMonitor, type TradeMonitor } from "./monitor";
-import { PANCAKE_ROUTER_V2_ABI } from "./abi";
+import { ERC20_MIN_ABI, PANCAKE_ROUTER_V2_ABI } from "./abi";
+import { validateWalletTopology } from "./walletTopology";
+import {
+  addUnresolved,
+  applyReconciliation,
+  emptySnapshot,
+  loadUnresolved,
+  reconcileTx,
+  removeUnresolved,
+  snapshotOf,
+  unresolvedGateReason,
+  type AccountingRole,
+  type UnresolvedTx,
+} from "./unresolved";
 import {
   getPosition,
   listPositions,
@@ -177,8 +190,16 @@ export function CopyTrade({
   // 自动监听状态
   const [monitoring, setMonitoring] = useState(false);
   const [monitorStarting, setMonitorStarting] = useState(false);
-  // 自动执行出现 unknown 后进入待对账，要求人工核对链上结果后才能重启监听
-  const [reconcileRequired, setReconcileRequired] = useState(false);
+  // 统一 unresolved 门禁：自动/手工出现 unknown 后登记，跨标签/remount 保留；
+  // 只有真实查询链上 receipt 并对账完成后才解除。
+  const [unresolved, setUnresolved] = useState<UnresolvedTx[]>(() =>
+    loadUnresolved()
+  );
+  // 门禁原因（含 Fail Closed 数据损坏）；与 unresolved 列表一起刷新
+  const [gateReason, setGateReason] = useState<string | null>(() =>
+    unresolvedGateReason()
+  );
+  const [reconciling, setReconciling] = useState(false);
   const [signalLog, setSignalLog] = useState<SignalLogEntry[]>([]);
   const monitorRef = useRef<TradeMonitor | null>(null);
   // 单线程 FIFO 信号队列：busy → enqueue，不并发、不丢信号；
@@ -195,8 +216,6 @@ export function CopyTrade({
   const activeSignalHashesRef = useRef<Set<string>>(new Set());
   // 防止 startMonitor 重入（快速双击创建两个监听器）
   const monitorStartingRef = useRef(false);
-  // 待对账标记：unknown 后置 true，人工确认前禁止重启监听
-  const reconcileRequiredRef = useRef(false);
   // 本工具人工广播的 Leader 买入 txHash，监听不得将其作为外部信号重复跟单
   const manualLeaderTxHashesRef = useRef<Set<string>>(new Set());
   // 组件生命周期 + 启动代际：防止异步 startMonitor 在组件卸载后创建孤儿 Monitor
@@ -485,6 +504,11 @@ export function CopyTrade({
       return;
     }
     if (executionRef.current) return;
+    const gateReason = unresolvedGateReason();
+    if (gateReason) {
+      setError(gateReason);
+      return;
+    }
     executionRef.current = true;
     setIsExecuting(true);
     onExecutingChange(true);
@@ -517,6 +541,16 @@ export function CopyTrade({
         amountText: f.buyAmountText,
       }));
 
+      // 广播前重新校验钱包拓扑（Leader 可能在解析 Follower 之后发生变化）
+      const topology = validateWalletTopology(
+        leaderWallet!.address,
+        followerWallets.map((f) => f.wallet.address)
+      );
+      if (!topology.ok) {
+        setError(topology.error ?? "钱包拓扑非法，已阻止执行");
+        return;
+      }
+
       const initial: CopyTradeResult[] = [
         { role: "leader", name: "带单", address: leaderWallet!.address, buyAmount: leaderAmountText, status: "processing" },
         ...followerWallets.map((f) => ({
@@ -546,6 +580,41 @@ export function CopyTrade({
           });
         }
       );
+
+      // 登记 unresolved：手工 Leader/跟单买入出现 unknown 时进入全局门禁，等待真实对账
+      for (const r of finalResults) {
+        if (r.status !== "unknown" || !r.txHash) continue;
+        const fw = followerWallets.find(
+          (f) => f.wallet.address.toLowerCase() === r.address.toLowerCase()
+        );
+        const role: AccountingRole =
+          r.role === "leader" ? "leader" : "follower";
+        const prev =
+          role === "follower"
+            ? getPosition(network.chainId, r.address, tokenMeta!.address)
+            : undefined;
+        addUnresolved({
+          chainId: network.chainId,
+          txHash: r.txHash,
+          walletAddress: r.address.toLowerCase(),
+          tokenAddress: tokenMeta!.address.toLowerCase(),
+          tokenSymbol: tokenMeta!.symbol,
+          tokenDecimals: tokenMeta!.decimals,
+          side: "buy",
+          phase: "swap",
+          accountingRole: role,
+          plannedAmountWei:
+            r.role === "leader" ? leaderWei : (fw?.amountWei ?? 0n),
+          balanceBeforeWei: r.balanceBeforeWei,
+          snapshotBefore:
+            role === "follower"
+              ? prev
+                ? snapshotOf(prev)
+                : emptySnapshot(tokenMeta!.symbol, tokenMeta!.decimals)
+              : undefined,
+        });
+      }
+      refreshUnresolved();
 
       // 买入成功后记录跟单持仓（仅 Follower，Leader 持仓由带单方自行管理）
       for (const r of finalResults) {
@@ -595,6 +664,11 @@ export function CopyTrade({
       return;
     }
     if (executionRef.current) return;
+    const gateReason = unresolvedGateReason();
+    if (gateReason) {
+      setError(gateReason);
+      return;
+    }
 
     // 跨链 Fail Closed：持仓链与当前网络不一致时禁止任何广播
     if (pos.chainId !== network.chainId) {
@@ -656,11 +730,27 @@ export function CopyTrade({
           `已卖出 ${pos.tokenSymbol}${res.swapHash ? " · " + res.swapHash.slice(0, 10) + "..." : ""}`
         );
       } else if (res.status === "unknown") {
-        // 已广播但未确认：保留 txHash，不扣减持仓，提醒人工核对，避免重复卖出
+        // 已广播但未确认：保留 txHash，不扣减持仓，登记 unresolved 并进入门禁
         const hash = res.swapHash ?? res.approvalHash ?? "";
+        if (hash) {
+          addUnresolved({
+            chainId: network.chainId,
+            txHash: hash,
+            walletAddress: pos.follower.toLowerCase(),
+            tokenAddress: pos.tokenAddress.toLowerCase(),
+            tokenSymbol: pos.tokenSymbol,
+            tokenDecimals: pos.decimals,
+            side: "sell",
+            phase: res.phase === "approval" ? "approval" : "swap",
+            accountingRole: "follower",
+            plannedAmountWei: sellWei,
+            snapshotBefore: snapshotOf(current!),
+          });
+          refreshUnresolved();
+        }
         const phase = res.phase === "approval" ? "授权" : "卖出";
         setError(
-          `${phase}已广播但状态未确认（${hash}），请先通过链上检查结果，勿重复操作`
+          `${phase}已广播但状态未确认（${hash}），已登记待对账，请查询链上结果，勿重复操作`
         );
       } else {
         setError(res.error ?? "卖出失败");
@@ -722,10 +812,9 @@ export function CopyTrade({
     markPendingCancelled(reason);
   }
 
-  // 自动执行出现 unknown（已广播但无法确认）→ 进入待对账：停止监听 + 停止消费队列 + 要求人工核对
+  // 自动执行出现 unknown（已广播但无法确认）→ 停止监听 + 停止消费队列，
+  // 由 unresolved 门禁与真实对账流程接管，禁止通过单纯确认按钮清除。
   function enterReconciliation(reason: string) {
-    reconcileRequiredRef.current = true;
-    setReconcileRequired(true);
     monitorRef.current?.stop();
     monitorRef.current = null;
     haltAuto(reason);
@@ -733,12 +822,65 @@ export function CopyTrade({
     setError(reason);
   }
 
-  function confirmReconcile() {
-    reconcileRequiredRef.current = false;
-    setReconcileRequired(false);
-    setPositions(listPositions(network.chainId)); // 重新加载持仓
+  // 读取代币余额（用于买入对账时以可靠差值计算实际到账量）
+  async function readTokenBalance(wallet: string, token: string): Promise<bigint> {
+    const contract = new ethers.Contract(token, ERC20_MIN_ABI, provider);
+    return BigInt(await contract.balanceOf(wallet));
+  }
+
+  // 同步刷新 unresolved 列表与门禁原因（含 Fail Closed 数据损坏）
+  function refreshUnresolved() {
+    setUnresolved(loadUnresolved());
+    setGateReason(unresolvedGateReason());
+  }
+
+  // 真实对账：逐个查询链上 receipt，得到确定结果并更新账本后才解除该记录；
+  // 只读链上，绝不广播任何交易。
+  async function reconcileAll() {
+    if (reconciling) return;
+    setReconciling(true);
     setError("");
-    setMessage("已确认人工核对，可重新启动监听");
+    setMessage("");
+    try {
+      let updated = loadUnresolved();
+      let resolved = 0;
+      let pending = 0;
+      let inconsistent = 0;
+      for (const tx of [...updated]) {
+        const result = await reconcileTx(tx, provider, readTokenBalance);
+        if (result.outcome === "pending") {
+          pending++;
+          continue;
+        }
+        const apply = applyReconciliation(tx, result);
+        if (apply.status === "pending") {
+          pending++;
+          continue;
+        }
+        if (apply.status === "inconsistent") {
+          inconsistent++;
+          continue;
+        }
+        // 只有账本达到目标状态并验证成功（applied）后才删除 unresolved。
+        // applyReconciliation 幂等：即使 removeUnresolved 持久化失败，再次对账结果不变。
+        updated = removeUnresolved(tx.id);
+        resolved++;
+      }
+      refreshUnresolved();
+      setPositions(listPositions(network.chainId));
+      if (updated.length === 0) {
+        setMessage(`对账完成：已核对 ${resolved} 笔，门禁已解除`);
+      } else {
+        const parts = [`已核对 ${resolved} 笔`];
+        if (pending > 0) parts.push(`仍有 ${pending} 笔待确认`);
+        if (inconsistent > 0) parts.push(`${inconsistent} 笔账本无法恢复`);
+        setMessage(`${parts.join("，")}，门禁保持锁定`);
+      }
+    } catch (e) {
+      setError(safeErrorMessage(e));
+    } finally {
+      setReconciling(false);
+    }
   }
 
   function handleSignal(signal: TradeSignal) {
@@ -900,6 +1042,32 @@ export function CopyTrade({
         () => {}
       );
 
+      // 登记 unresolved：自动跟买出现 unknown 时进入全局门禁，等待真实对账
+      for (const r of buyResults) {
+        if (r.status !== "unknown" || !r.txHash) continue;
+        const fw = followerWallets.find(
+          (f) => f.wallet.address.toLowerCase() === r.address.toLowerCase()
+        );
+        const prev = getPosition(network.chainId, r.address, signal.tokenAddress);
+        addUnresolved({
+          chainId: network.chainId,
+          txHash: r.txHash,
+          walletAddress: r.address.toLowerCase(),
+          tokenAddress: signal.tokenAddress.toLowerCase(),
+          tokenSymbol: meta.symbol,
+          tokenDecimals: meta.decimals,
+          side: "buy",
+          phase: "swap",
+          accountingRole: "follower",
+          plannedAmountWei: fw?.amountWei ?? 0n,
+          balanceBeforeWei: r.balanceBeforeWei,
+          snapshotBefore: prev
+            ? snapshotOf(prev)
+            : emptySnapshot(meta.symbol, meta.decimals),
+        });
+      }
+      refreshUnresolved();
+
       // 买入成功后写持仓（仅 success 且实际到账 > 0）
       for (const r of buyResults) {
         if (r.role !== "follower" || r.status !== "success") continue;
@@ -1010,6 +1178,29 @@ export function CopyTrade({
       );
       setPositions(listPositions(network.chainId));
 
+      // 登记 unresolved：自动跟卖出现 unknown 时进入全局门禁，等待真实对账
+      const relatedDecimals = related[0]?.decimals ?? 0;
+      for (const r of sellResults) {
+        if (r.status !== "unknown" || !r.txHash) continue;
+        const prev = getPosition(network.chainId, r.address, signal.tokenAddress);
+        addUnresolved({
+          chainId: network.chainId,
+          txHash: r.txHash,
+          walletAddress: r.address.toLowerCase(),
+          tokenAddress: signal.tokenAddress.toLowerCase(),
+          tokenSymbol: symbol,
+          tokenDecimals: relatedDecimals,
+          side: "sell",
+          phase: r.phase === "approval" ? "approval" : "swap",
+          accountingRole: "follower",
+          plannedAmountWei: r.sellAmountWei,
+          snapshotBefore: prev
+            ? snapshotOf(prev)
+            : emptySnapshot(symbol, relatedDecimals),
+        });
+      }
+      refreshUnresolved();
+
       const followerDetails: SignalFollowerResult[] = sellResults.map((r) => ({
         name: r.name,
         address: r.address,
@@ -1069,9 +1260,10 @@ export function CopyTrade({
       setError("手动跟单执行中，无法开始监听");
       return;
     }
-    // 存在待人工核对的交易，须先确认链上结果再重启监听
-    if (reconcileRequiredRef.current) {
-      setError("存在待人工核对的交易，请先核对链上结果并确认后再启动监听");
+    // 存在 unresolved 待对账交易，须先真实查询链上结果并完成对账后再重启监听
+    const gateReason = unresolvedGateReason();
+    if (gateReason) {
+      setError(gateReason);
       return;
     }
     monitorStartingRef.current = true;
@@ -1106,6 +1298,16 @@ export function CopyTrade({
 
       // 提前校验滑点，避免监听过程中才发现配置非法
       slippagePercentToBps(slippageRef.current);
+
+      // 创建监听器前重新校验钱包拓扑（Leader 可能在解析 Follower 之后发生变化）
+      const topology = validateWalletTopology(
+        leaderWallet.address,
+        followersRef.current.map((f) => f.address)
+      );
+      if (!topology.ok) {
+        setError(topology.error ?? "钱包拓扑非法，无法开始监听");
+        return;
+      }
 
       const router = new ethers.Contract(
         network.routerAddress,
@@ -1407,7 +1609,7 @@ export function CopyTrade({
           </button>
           <button
             onClick={start}
-            disabled={isExecuting || monitoring || monitorStarting || !rpcReady}
+            disabled={isExecuting || monitoring || monitorStarting || !rpcReady || gateReason != null}
             className="px-4 py-2 rounded-md bg-blue-600 hover:bg-blue-500 disabled:opacity-50 font-medium"
           >
             {isExecuting ? "执行中..." : "开始跟单"}
@@ -1430,7 +1632,7 @@ export function CopyTrade({
             )}
             <button
               onClick={monitoring ? stopMonitor : startMonitor}
-              disabled={!rpcReady || isExecuting || monitorStarting}
+              disabled={!rpcReady || isExecuting || monitorStarting || gateReason != null}
               className={`px-4 py-2 rounded-md font-medium disabled:opacity-50 ${
                 monitoring
                   ? "bg-red-600 hover:bg-red-500"
@@ -1450,17 +1652,46 @@ export function CopyTrade({
           只触发一次。
         </p>
 
-        {reconcileRequired && (
-          <div className="mt-3 rounded-lg border border-orange-800 bg-orange-900/20 px-4 py-3 flex items-center justify-between gap-3">
-            <p className="text-sm text-orange-300">
-              存在待人工核对的链上交易，请先核对结果并确认后再重启监听。
-            </p>
-            <button
-              onClick={confirmReconcile}
-              className="px-3 py-1.5 rounded-md bg-orange-600 hover:bg-orange-500 text-sm whitespace-nowrap"
-            >
-              我已人工核对
-            </button>
+        {(gateReason != null || unresolved.length > 0) && (
+          <div className="mt-3 rounded-lg border border-orange-800 bg-orange-900/20 px-4 py-3 space-y-3">
+            {unresolved.length > 0 ? (
+              <>
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-sm text-orange-300">
+                    存在 {unresolved.length} 笔待对账的链上交易，请先查询链上结果完成对账后再操作。
+                  </p>
+                  <button
+                    onClick={reconcileAll}
+                    disabled={reconciling}
+                    className="px-3 py-1.5 rounded-md bg-orange-600 hover:bg-orange-500 text-sm whitespace-nowrap disabled:opacity-50"
+                  >
+                    {reconciling ? "查询中..." : "重新查询链上结果"}
+                  </button>
+                </div>
+                <ul className="space-y-1 text-xs text-orange-200/90">
+                  {unresolved.map((u) => (
+                    <li key={u.id} className="break-all">
+                      {u.accountingRole === "leader" ? "带单" : "跟单"} ·{" "}
+                      {u.side === "buy" ? "买入" : "卖出"} ·{" "}
+                      {u.phase === "approval" ? "授权" : "卖出"}
+                      {" · "}
+                      <a
+                        href={txExplorerUrl(network, u.txHash)}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-blue-400 hover:underline font-mono"
+                      >
+                        {u.txHash.slice(0, 10)}…{u.txHash.slice(-8)}
+                      </a>
+                      {" · "}
+                      {u.tokenSymbol || u.tokenAddress.slice(0, 8)}
+                    </li>
+                  ))}
+                </ul>
+              </>
+            ) : (
+              <p className="text-sm text-orange-300">{gateReason}</p>
+            )}
           </div>
         )}
 
@@ -1660,7 +1891,7 @@ export function CopyTrade({
                         onClick={() =>
                           sellPosition(p, sellPct[posKey(p)] ?? "100")
                         }
-                        disabled={isExecuting || monitoring}
+                        disabled={isExecuting || monitoring || gateReason != null}
                         className="px-3 py-1 rounded-md bg-red-600 hover:bg-red-500 disabled:opacity-50 text-sm"
                       >
                         卖出

@@ -61,6 +61,8 @@ export interface CopyTradeResult {
   error?: string;
   // 买入确认后实际到账的代币数量（balance delta），持仓记账 SoT
   receivedAmountWei?: bigint;
+  // 广播前代币余额，unknown 时用于对账计算实际到账量
+  balanceBeforeWei?: bigint;
   // 链上成功但到账量无法解析时的结算告警
   accountingWarning?: string;
 }

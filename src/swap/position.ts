@@ -121,6 +121,38 @@ export function reducePosition(
   return pos;
 }
 
+// 幂等设置「确定目标持仓」：直接覆盖为精确的 amountWei / costBnbWei。
+// 供对账后恢复账本使用；重复调用同一目标得到完全相同结果，不会重复加减仓。
+// amountWei <= 0 时移除记录（返回 null）。
+export function setPosition(
+  chainId: number,
+  follower: string,
+  tokenAddress: string,
+  tokenSymbol: string,
+  decimals: number,
+  amountWei: bigint,
+  costBnbWei: bigint,
+  buyTxHash?: string
+): Position | null {
+  const k = key(chainId, follower, tokenAddress);
+  if (amountWei <= 0n) {
+    store.delete(k);
+    return null;
+  }
+  const pos = buildPosition(
+    chainId,
+    follower,
+    tokenAddress,
+    tokenSymbol,
+    decimals,
+    amountWei,
+    costBnbWei,
+    buyTxHash
+  );
+  store.set(k, pos);
+  return pos;
+}
+
 export function getPosition(
   chainId: number,
   follower: string,

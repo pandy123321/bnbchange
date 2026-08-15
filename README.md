@@ -6,7 +6,7 @@ BSC 批量转账 + PancakeSwap V2 带单跟单的内部桌面工具（V0.1）。
 - 多链批量转账（BSC / Ethereum / Polygon / Arbitrum / Optimism / Base），支持原生币 + ERC20
 - Leader 先买入，成功后 Followers 顺序跟买（仅 BSC / PancakeSwap）
 - 内部系统：跟单地址与私钥由后台加密托管（AES-256-GCM），超级管理员可查看（留审计）；后台部署在公网服务器，供内部人员使用
-- 授权码验证一次后本地记住，后续打开免输入（过期自动失效）
+- 授权验证每次应用启动都需通过授权服务器**在线验证**；客户端不信任本地 localStorage 中的授权状态（localStorage 仅作非敏感的待对账元数据缓存，不承载任何授权信任）
 
 ## 技术栈
 
@@ -44,7 +44,7 @@ npm run electron
 
 授权码验证需要一台**远程授权服务器**（后端代码在 `license-server/`）。
 
-> 规划：后续授权功能将合并进统一后台 `admin-server/`（私钥托管 + 操作日志 + 持仓管理 + 角色权限），原 `license-server/` 功能由 `admin-server/` 取代。当前 README 仍按 `license-server/` 描述。
+> 授权验证接口（`POST /api/tool/verify-license`、`/api/tool/issue-session`、`/api/tool/verify-session`）已由统一后台 `admin-server/`（私钥托管 + 操作日志 + 持仓管理 + 角色权限）提供；`license-server/` 为独立精简实现，两者任选其一部署即可，接口路径一致。
 
 ### 部署后端
 
@@ -92,7 +92,7 @@ VITE_LICENSE_API_BASE_URL=https://你的服务器域名或IP
 4. 在浏览器里操作，小狐狸（MetaMask）钱包为原生完整体验，直接点「连接小狐狸」即可。
 
 > 桌面端启动时会在本地起一个静态服务器（默认 `127.0.0.1:4173`）服务前端页面，关闭桌面端后该服务停止。
-> 浏览器记住授权后（localStorage），下次直接访问 `http://127.0.0.1:4173` 也能进入（授权未过期时）。
+> 每次启动都需要授权服务器在线验证；客户端**不信任** localStorage 中的授权状态，仅凭本地记录无法进入操作界面。
 
 ## 带单跟单（PancakeSwap 交易对）
 
