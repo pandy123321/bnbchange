@@ -4,9 +4,13 @@
 //
 // 资金安全约束（Fail Closed）：
 // 1. 仅对 receipt.status === 1 的 Leader 交易生成信号（回滚交易绝不触发 Followers）。
-// 2. lastBlock 仅在区块完整成功扫描后才推进（RPC 异常不丢块，链读取重试允许）。
-// 3. 实际链 ID 与预期不一致时立即停止监听，不再产生信号。
-// 4. 落后超过安全窗口时不静默跳块，立即停止并提示人工核对。
+// 2. receipt 暂不可用（null）视为 unresolved：不写去重、不 checkpoint，抛错重试。
+// 3. lastBlock 仅在区块完整成功扫描后才推进（RPC 异常不丢块，链读取重试允许）。
+// 4. 实际链 ID 与预期不一致时立即停止监听；RPC 连续失败达阈值时停止监听。
+// 5. 落后超过安全窗口时不静默跳块，立即停止并提示人工核对。
+//
+// 注意：这里的 seenTx 去重是性能优化层，不是 exactly-once 的最终防线；
+// 执行层（CopyTrade）持有全生命周期 txHash 去重作为最后资金防线。
 
 import { ethers } from "ethers";
 import type { TradeSignal } from "../types";
@@ -30,14 +34,17 @@ export interface TradeMonitor {
   running: () => boolean;
 }
 
-// txHash 去重缓存上限；超出清空（极端情况下宁可丢历史去重也不无限增长）
+// txHash 去重缓存上限（FIFO 淘汰最旧项，绝不整表 clear，避免 Block 重扫时重复触发）
 const MAX_TX_CACHE = 10_000;
 // 落后超过该块数时 Fail Closed，禁止静默跳块
 const MAX_SCAN_BEHIND = 20;
+// RPC 连续失败达该次数时 Fail Closed（短暂抖动可容忍，持续不可靠则停止自动执行）
+const MAX_CONSECUTIVE_FAILURES = 3;
 
 export function startTradeMonitor(config: TradeMonitorConfig): TradeMonitor {
   const iface = new ethers.Interface(PANCAKE_ROUTER_V2_ABI);
-  const seenTx = new Set<string>();
+  // 只缓存 Leader→Router 候选交易的 hash，FIFO 淘汰；避免缓存所有普通区块交易
+  const seenTx = new Map<string, true>();
   const leader = config.leaderAddress.toLowerCase();
   const router = config.routerAddress.toLowerCase();
   const wbnb = config.wbnbAddress.toLowerCase();
@@ -47,6 +54,7 @@ export function startTradeMonitor(config: TradeMonitorConfig): TradeMonitor {
   let scanning = false;
   let initialized = false;
   let lastBlock = 0;
+  let consecutiveFailures = 0;
   let timer: ReturnType<typeof setInterval> | null = null;
 
   // Fail Closed：致命错误仅触发一次，停止轮询并通知上层
@@ -61,7 +69,17 @@ export function startTradeMonitor(config: TradeMonitorConfig): TradeMonitor {
     config.onError(new Error(reason));
   }
 
-  // 校验实际链 ID；不一致 → Fail Closed。RPC 临时失败则抛出，交由上层保持游标。
+  // FIFO 淘汰最旧项，绝不整表 clear
+  function rememberSeen(hash: string): void {
+    seenTx.set(hash, true);
+    while (seenTx.size > MAX_TX_CACHE) {
+      const oldest = seenTx.keys().next().value;
+      if (oldest === undefined) break;
+      seenTx.delete(oldest);
+    }
+  }
+
+  // 校验实际链 ID；不一致 → Fail Closed。RPC 临时失败则抛出，交由上层计数。
   async function assertChain(): Promise<void> {
     const net = await config.provider.getNetwork();
     if (Number(net.chainId) !== config.expectedChainId) {
@@ -134,22 +152,21 @@ export function startTradeMonitor(config: TradeMonitorConfig): TradeMonitor {
       if (seenTx.has(tx.hash)) continue;
 
       const signal = decode(tx);
-      if (!signal) {
-        // 非目标交易（非 Leader→Router Swap）：直接去重，避免反复 decode
-        seenTx.add(tx.hash);
-        if (seenTx.size > MAX_TX_CACHE) seenTx.clear();
-        continue;
-      }
+      if (!signal) continue; // 非 Leader→Router 交易：不缓存，直接跳过
 
       // 仅对确认成功的 Leader 交易生成信号。
-      // receipt 读取失败会抛出 → tick catch 保持 lastBlock 不动，下一轮重扫本块；
-      // 因此这里必须在 receipt 成功获取后才写入 seenTx，避免失败时永久跳过该 tx。
       const receipt = await config.provider.getTransactionReceipt(tx.hash);
-      seenTx.add(tx.hash);
-      if (seenTx.size > MAX_TX_CACHE) seenTx.clear();
+      if (!receipt) {
+        // unresolved：不写 seenTx，不 checkpoint，抛错让本 Block 下一轮重试
+        throw new Error(
+          `Leader 交易 receipt 暂不可用（${tx.hash.slice(0, 10)}…），下一轮重试`
+        );
+      }
 
-      if (!receipt || receipt.status !== 1) {
-        // 回滚（status=0）或已不可见（重组）：绝不触发 Followers，且已标记去重
+      rememberSeen(tx.hash);
+
+      if (receipt.status !== 1) {
+        // confirmed revert：永久忽略，绝不触发 Followers
         continue;
       }
 
@@ -172,9 +189,13 @@ export function startTradeMonitor(config: TradeMonitorConfig): TradeMonitor {
       if (!initialized) {
         initialized = true;
         lastBlock = current;
+        consecutiveFailures = 0;
         return;
       }
-      if (current <= lastBlock) return;
+      if (current <= lastBlock) {
+        consecutiveFailures = 0;
+        return;
+      }
 
       const start = lastBlock + 1;
       if (current - start > MAX_SCAN_BEHIND) {
@@ -190,10 +211,19 @@ export function startTradeMonitor(config: TradeMonitorConfig): TradeMonitor {
         // 若 b 失败，lastBlock 保持 b-1，下一轮从 b 重试（链读取重试，非资金交易重试）
         lastBlock = b;
       }
+      consecutiveFailures = 0;
     } catch (e) {
-      // RPC 临时错误：游标保持不变，下一轮从失败块重试，绝不前移导致永久丢块
+      // RPC 临时错误：游标保持不变，下一轮从失败块重试，绝不前移导致永久丢块。
+      // 连续失败达阈值 → Fail Closed（监控链路已不可靠，停止自动资金执行）。
       if (!stopped) {
-        config.onError(e instanceof Error ? e : new Error(String(e)));
+        consecutiveFailures++;
+        if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+          failClosed(
+            `监听 RPC 连续失败 ${MAX_CONSECUTIVE_FAILURES} 次，已停止自动执行，请检查网络后重新启动`
+          );
+        } else {
+          config.onError(e instanceof Error ? e : new Error(String(e)));
+        }
       }
     } finally {
       scanning = false;

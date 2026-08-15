@@ -49,7 +49,7 @@ interface SignalLogEntry {
   direction: "buy" | "sell";
   tokenSymbol: string;
   amountText: string;
-  status: "detected" | "following" | "done" | "attention" | "error";
+  status: "detected" | "following" | "done" | "attention" | "cancelled" | "error";
   summary: string;
   followers?: SignalFollowerResult[];
 }
@@ -60,6 +60,7 @@ function SignalStatusBadge({ status }: { status: SignalLogEntry["status"] }) {
     following: ["bg-yellow-500/15 text-yellow-300", "跟单中"],
     done: ["bg-green-500/15 text-green-300", "完成"],
     attention: ["bg-orange-500/15 text-orange-300", "待确认"],
+    cancelled: ["bg-gray-500/15 text-gray-400", "已取消"],
     error: ["bg-red-500/15 text-red-300", "失败"],
   } as const;
   const [cls, label] = map[status];
@@ -170,6 +171,7 @@ export function CopyTrade({
 
   // 自动监听状态
   const [monitoring, setMonitoring] = useState(false);
+  const [monitorStarting, setMonitorStarting] = useState(false);
   const [signalLog, setSignalLog] = useState<SignalLogEntry[]>([]);
   const monitorRef = useRef<TradeMonitor | null>(null);
   // 单线程 FIFO 信号队列：busy → enqueue，不并发、不丢信号；
@@ -177,6 +179,12 @@ export function CopyTrade({
   const queueRef = useRef<TradeSignal[]>([]);
   const queueProcessingRef = useRef(false);
   const queueLimitReachedRef = useRef(false);
+  // 自动执行 Fail Closed 标记：monitor 停止/队列溢出/用户停止后，禁止继续消费 pending 队列
+  const autoHaltedRef = useRef(false);
+  // 全生命周期 txHash exactly-once 去重（最后资金防线）：覆盖 queued + executing + completed
+  const acceptedSignalHashesRef = useRef<Set<string>>(new Set());
+  // 防止 startMonitor 重入（快速双击创建两个监听器）
+  const monitorStartingRef = useRef(false);
   // latest-value refs：监听回调跨异步读取时始终拿到最新配置，避免闭包陈旧
   const followersRef = useRef(followers);
   followersRef.current = followers;
@@ -193,6 +201,7 @@ export function CopyTrade({
       monitorRef.current = null;
       queueRef.current = [];
       queueProcessingRef.current = false;
+      autoHaltedRef.current = true;
     };
   }, []);
 
@@ -637,7 +646,34 @@ export function CopyTrade({
     });
   }
 
+  // 将尚未执行的 pending 信号标记为 cancelled（停止/溢出/Fail Closed 时调用）
+  function markPendingCancelled(reason: string) {
+    const pending = queueRef.current;
+    queueRef.current = [];
+    for (const s of pending) {
+      upsertSignalLog({
+        txHash: s.txHash,
+        direction: s.direction,
+        tokenSymbol: "",
+        amountText: "",
+        status: "cancelled",
+        summary: reason,
+      });
+    }
+  }
+
+  // 自动执行 Fail Closed：停止继续消费 pending 队列，未开始的信号标记 cancelled。
+  // 已经开始并已广播的当前交易不会被伪取消（drainQueue 中正在 await 的信号会自然收尾）。
+  function haltAuto(reason: string) {
+    autoHaltedRef.current = true;
+    markPendingCancelled(reason);
+  }
+
   function handleSignal(signal: TradeSignal) {
+    // 全生命周期 exactly-once 去重（最后资金防线）：覆盖 queued + executing + completed
+    if (acceptedSignalHashesRef.current.has(signal.txHash)) return;
+    acceptedSignalHashesRef.current.add(signal.txHash);
+
     upsertSignalLog({
       txHash: signal.txHash,
       direction: signal.direction,
@@ -647,22 +683,20 @@ export function CopyTrade({
       summary: "已入队，等待执行",
     });
 
-    // 同 txHash 只入队一次（monitor 已去重，此处兜底）
-    if (queueRef.current.some((s) => s.txHash === signal.txHash)) return;
-
     if (queueRef.current.length >= MAX_SIGNAL_QUEUE) {
       // Fail Closed：队列溢出 → 停止监听，明确要求人工处理，不静默丢信号
       if (!queueLimitReachedRef.current) {
         queueLimitReachedRef.current = true;
-        stopMonitor();
         upsertSignalLog({
           txHash: signal.txHash,
           direction: signal.direction,
           tokenSymbol: "",
           amountText: "",
-          status: "error",
+          status: "cancelled",
           summary: `信号队列已满（${MAX_SIGNAL_QUEUE}），已停止监听，请人工核对积压信号后重新启动`,
         });
+        haltAuto(`队列已满，自动监听已停止，该信号未执行，请人工核对`);
+        stopMonitor();
       }
       return;
     }
@@ -678,6 +712,9 @@ export function CopyTrade({
     queueProcessingRef.current = true;
     try {
       while (queueRef.current.length > 0) {
+        // Fail Closed：monitor 已停止，禁止继续消费 pending 队列
+        if (autoHaltedRef.current) break;
+
         // Manual 资金操作占用锁时等待，不丢弃信号
         if (executionRef.current) {
           await new Promise((r) => setTimeout(r, 400));
@@ -893,27 +930,31 @@ export function CopyTrade({
   }
 
   async function startMonitor() {
+    // 防重入：已启动或正在启动中直接返回，避免快速双击创建多个监听器
+    if (monitorRef.current || monitorStartingRef.current) return;
+    monitorStartingRef.current = true;
+    setMonitorStarting(true);
     setError("");
     setMessage("");
 
-    if (!rpcReady) {
-      setError("RPC 网络未就绪，无法开始监听");
-      return;
-    }
-    if (!leaderWallet) {
-      setError("请先连接带单钱包（输入私钥或连接小狐狸）");
-      return;
-    }
-    if (followersRef.current.length === 0) {
-      setError("请先解析跟单钱包");
-      return;
-    }
-    if (!network.routerAddress) {
-      setError("当前网络不支持跟单监听");
-      return;
-    }
-
     try {
+      if (!rpcReady) {
+        setError("RPC 网络未就绪，无法开始监听");
+        return;
+      }
+      if (!leaderWallet) {
+        setError("请先连接带单钱包（输入私钥或连接小狐狸）");
+        return;
+      }
+      if (followersRef.current.length === 0) {
+        setError("请先解析跟单钱包");
+        return;
+      }
+      if (!network.routerAddress) {
+        setError("当前网络不支持跟单监听");
+        return;
+      }
+
       // 提前校验滑点，避免监听过程中才发现配置非法
       slippagePercentToBps(slippageRef.current);
 
@@ -933,7 +974,8 @@ export function CopyTrade({
         onSignal: handleSignal,
         onError: (err) => setError(`监听异常：${safeErrorMessage(err)}`),
         onStopped: (reason) => {
-          // Fail Closed：monitor 已自行停止，同步 UI 状态并展示原因
+          // Fail Closed：monitor 已自行停止，同步 UI 状态并停止 pending 自动执行
+          haltAuto(reason);
           setMonitoring(false);
           monitorRef.current = null;
           setError(reason);
@@ -942,21 +984,25 @@ export function CopyTrade({
 
       monitorRef.current = monitor;
       queueLimitReachedRef.current = false;
+      autoHaltedRef.current = false;
       setMonitoring(true);
       setMessage(
         `已开始监听带单地址 ${leaderWallet.address.slice(0, 10)}...（区块轮询，4 秒/次）`
       );
     } catch (e) {
       setError(safeErrorMessage(e));
+    } finally {
+      monitorStartingRef.current = false;
+      setMonitorStarting(false);
     }
   }
 
   function stopMonitor() {
     monitorRef.current?.stop();
     monitorRef.current = null;
-    // 用户主动停止：清空未处理信号队列；已广播的交易不会被强制取消（drainQueue 中正在 await 的
-    // 信号会自然执行完成，shift 已将其移出队列，清空不影响正在执行的交易）
-    queueRef.current = [];
+    // 用户主动停止：停止继续消费 pending 队列并标记 cancelled；
+    // 已广播的交易不会被强制取消（drainQueue 中正在 await 的信号会自然收尾）
+    haltAuto("自动监听已停止，该信号未执行，请人工核对");
     setMonitoring(false);
     setMessage("已停止监听");
   }
@@ -1221,14 +1267,18 @@ export function CopyTrade({
             )}
             <button
               onClick={monitoring ? stopMonitor : startMonitor}
-              disabled={!rpcReady || isExecuting}
+              disabled={!rpcReady || isExecuting || monitorStarting}
               className={`px-4 py-2 rounded-md font-medium disabled:opacity-50 ${
                 monitoring
                   ? "bg-red-600 hover:bg-red-500"
                   : "bg-green-600 hover:bg-green-500"
               }`}
             >
-              {monitoring ? "停止监听" : "开始监听"}
+              {monitorStarting
+                ? "启动中..."
+                : monitoring
+                  ? "停止监听"
+                  : "开始监听"}
             </button>
           </div>
         </div>
