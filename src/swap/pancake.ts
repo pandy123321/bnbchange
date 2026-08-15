@@ -135,11 +135,25 @@ export async function buyToken(params: BuyParams): Promise<BuyResult> {
     const receipt = await tx.wait();
 
     if (receipt?.status === 1) {
-      const balanceAfter = BigInt(
-        await token.balanceOf(params.wallet.address)
-      );
-      receivedAmountWei =
-        balanceAfter > balanceBefore ? balanceAfter - balanceBefore : 0n;
+      // 交易已确认 success，后续结算 RPC 故障不得改变交易状态（保持 success）
+      try {
+        const balanceAfter = BigInt(
+          await token.balanceOf(params.wallet.address)
+        );
+        receivedAmountWei =
+          balanceAfter > balanceBefore ? balanceAfter - balanceBefore : 0n;
+      } catch {
+        return {
+          hash,
+          status: "success",
+          amountOutMin,
+          expectedOut,
+          receivedAmountWei: 0n,
+          accountingWarning:
+            "买入已确认，但暂时无法读取实际到账量，请链上核对，未计入持仓",
+        };
+      }
+
       if (receivedAmountWei <= 0n) {
         return {
           hash,
@@ -246,6 +260,10 @@ export interface SellResult {
   error?: string;
 }
 
+// 卖出 Swap 在 allowance 不足导致预检 revert 时使用的保守 Gas 预算上限。
+// 仅是资金预算，不代表 Swap 业务一定可执行；Testnet 需按典型 FOT 代币实测校准。
+const SELL_SWAP_GAS_FALLBACK_LIMIT = 1_500_000n;
+
 export async function sellToken(params: SellParams): Promise<SellResult> {
   let approvalHash: string | undefined;
   let approvalConfirmed = false;
@@ -289,7 +307,8 @@ export async function sellToken(params: SellParams): Promise<SellResult> {
       approvalGasCost = BigInt(approveGas) * gasPrice;
     }
 
-    // swap gas：allowance 不足时 estimateGas 会 revert，回退到保守上限预算
+    // swap gas：allowance 不足时 estimateGas 会 revert，回退到保守预算上限；
+    // 若 allowance 已充足仍 revert，说明 Swap 业务本身不可执行，必须 Fail Closed。
     let swapGasCost: bigint;
     try {
       const swapGas = params.supportFeeOnTransfer
@@ -308,8 +327,13 @@ export async function sellToken(params: SellParams): Promise<SellResult> {
             deadline0
           );
       swapGasCost = BigInt(swapGas) * gasPrice;
-    } catch {
-      swapGasCost = 500_000n * gasPrice;
+    } catch (error) {
+      if (!needsApproval) {
+        // allowance 已充足仍 revert → 非 allowance 前置条件问题，禁止继续授权
+        throw error;
+      }
+      // allowance 不足导致的预检 revert：仅作资金预算，不代表 Swap 一定可执行
+      swapGasCost = SELL_SWAP_GAS_FALLBACK_LIMIT * gasPrice;
     }
 
     const nativeBalance0 = await params.wallet.provider!.getBalance(

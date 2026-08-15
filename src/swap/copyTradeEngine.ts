@@ -59,12 +59,22 @@ export async function runCopyTrade(
   results[0] = leaderResult;
   onUpdate(0, leaderResult);
 
-  // Leader 失败/未确认 → 停止，Followers 全部标记 skipped
-  if (leaderRes.status !== "success") {
-    const reason =
-      leaderRes.status === "unknown"
-        ? "带单交易已广播但状态未确认，跟单钱包未执行"
-        : "带单买入失败，跟单钱包未执行";
+  // 是否允许继续跟单：Leader 链上成功、实际到账 > 0、且无结算告警才可触发 Followers
+  const leaderFollowable =
+    leaderRes.status === "success" &&
+    leaderRes.receivedAmountWei > 0n &&
+    !leaderRes.accountingWarning;
+
+  // Leader 失败/未确认/到账异常 → 停止，Followers 全部标记 skipped
+  if (!leaderFollowable) {
+    let reason: string;
+    if (leaderRes.status === "unknown") {
+      reason = "带单交易已广播但状态未确认，跟单钱包未执行";
+    } else if (leaderRes.status !== "success") {
+      reason = "带单买入失败，跟单钱包未执行";
+    } else {
+      reason = "带单买入已确认，但实际到账异常，已停止跟单";
+    }
 
     for (let i = 0; i < config.followers.length; i++) {
       const follower = config.followers[i];
