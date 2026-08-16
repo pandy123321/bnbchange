@@ -1,7 +1,7 @@
 import type { NetworkConfig } from "../config/networks";
 import type { CopyTradeResult, SignerWallet, SimpleTxStatus } from "../types";
 import { buyToken, sellToken } from "./pancake";
-import { getPosition, reducePosition } from "./position";
+import { getPosition, reducePosition, type Position } from "./position";
 
 export interface CopyTradeWallet {
   role: "leader" | "follower";
@@ -206,8 +206,9 @@ export interface SellFollowResult {
   error?: string;
 }
 
-// 自动跟单卖出编排：Leader 已在链上卖出，这里让每个持有该代币的 Follower 全额卖出并减仓。
+// 自动跟单卖出编排：Leader 已在链上卖出，这里让每个持有该代币的 Follower 按策略卖出并减仓。
 // 仅确认 success 才扣减持仓；unknown 保留 txHash、不减仓，交由人工核对，避免重复卖出。
+// sellQty：卖出数量计算器（策略：比例/倍数），默认全额卖出。
 export async function sellFollowersForToken(
   config: {
     chainId: number;
@@ -216,10 +217,12 @@ export async function sellFollowersForToken(
     network: NetworkConfig;
     supportFeeOnTransfer: boolean;
     followers: CopyTradeWallet[];
+    sellQty?: (pos: Position) => bigint;
   },
   onUpdate: (index: number, result: SellFollowResult) => void
 ): Promise<SellFollowResult[]> {
   const results: SellFollowResult[] = [];
+  const resolveQty = config.sellQty ?? ((pos: Position) => pos.amountWei);
 
   for (let i = 0; i < config.followers.length; i++) {
     const follower = config.followers[i];
@@ -244,12 +247,28 @@ export async function sellFollowersForToken(
       continue;
     }
 
+    const sellWei = resolveQty(pos);
+    if (sellWei <= 0n) {
+      const skip: SellFollowResult = {
+        role: "follower",
+        name: follower.name,
+        address: follower.wallet.address,
+        tokenSymbol: pos.tokenSymbol,
+        sellAmountWei: 0n,
+        status: "skipped",
+        error: "卖出数量为 0，已跳过",
+      };
+      results.push(skip);
+      onUpdate(i, skip);
+      continue;
+    }
+
     const init: SellFollowResult = {
       role: "follower",
       name: follower.name,
       address: follower.wallet.address,
       tokenSymbol: pos.tokenSymbol,
-      sellAmountWei: pos.amountWei,
+      sellAmountWei: sellWei,
       status: "processing",
     };
     results.push(init);
@@ -258,7 +277,7 @@ export async function sellFollowersForToken(
     const res = await sellToken({
       wallet: follower.wallet,
       tokenAddress: config.tokenAddress,
-      amountInWei: pos.amountWei,
+      amountInWei: sellWei,
       slippageBps: config.slippageBps,
       network: config.network,
       supportFeeOnTransfer: config.supportFeeOnTransfer,
@@ -271,7 +290,7 @@ export async function sellFollowersForToken(
         config.chainId,
         follower.wallet.address,
         config.tokenAddress,
-        pos.amountWei
+        sellWei
       );
       txHash = res.swapHash ?? res.approvalHash;
     } else if (res.status === "unknown") {
@@ -283,7 +302,7 @@ export async function sellFollowersForToken(
       name: follower.name,
       address: follower.wallet.address,
       tokenSymbol: pos.tokenSymbol,
-      sellAmountWei: pos.amountWei,
+      sellAmountWei: sellWei,
       status,
       phase: status === "success" ? "swap" : res.phase,
       txHash,

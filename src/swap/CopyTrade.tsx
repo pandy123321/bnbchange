@@ -26,6 +26,15 @@ import { startTradeMonitor, type TradeMonitor } from "./monitor";
 import { ERC20_MIN_ABI, PANCAKE_ROUTER_V2_ABI } from "./abi";
 import { validateWalletTopology } from "./walletTopology";
 import {
+  buyOnceKey,
+  calcBuyAmount,
+  calcSellQuantity,
+  defaultStrategy,
+  shouldFollow,
+  validateStrategy,
+  type CopyStrategy,
+} from "./strategy";
+import {
   addUnresolved,
   applyReconciliation,
   emptySnapshot,
@@ -201,6 +210,11 @@ export function CopyTrade({
   );
   const [reconciling, setReconciling] = useState(false);
   const [signalLog, setSignalLog] = useState<SignalLogEntry[]>([]);
+  // 简单策略
+  const [strategy, setStrategy] = useState<CopyStrategy>(defaultStrategy());
+  const [buyMinAmountText, setBuyMinAmountText] = useState("");
+  // 只跟一次：本次监听会话内已跟单的 (Leader, Token) 键集合（session scope）
+  const followedOnceRef = useRef<Set<string>>(new Set());
   const monitorRef = useRef<TradeMonitor | null>(null);
   // 单线程 FIFO 信号队列：busy → enqueue，不并发、不丢信号；
   // 资金操作统一经过 executionRef / isExecuting / onExecutingChange 全局锁
@@ -228,6 +242,8 @@ export function CopyTrade({
   slippageRef.current = slippageText;
   const supportFotRef = useRef(supportFeeOnTransfer);
   supportFotRef.current = supportFeeOnTransfer;
+  const strategyRef = useRef(strategy);
+  strategyRef.current = strategy;
 
   useEffect(() => {
     mountedRef.current = true;
@@ -883,6 +899,23 @@ export function CopyTrade({
     }
   }
 
+  function shortAddr(addr: string): string {
+    return addr.length > 12 ? `${addr.slice(0, 6)}…${addr.slice(-4)}` : addr;
+  }
+
+  function describeBuyStrategy(s: CopyStrategy): string {
+    return s.buyMode === "ratio"
+      ? `比例 ${Math.round(s.buyValue * 100)}%`
+      : `倍数 ${s.buyValue}`;
+  }
+
+  function describeSellStrategy(s: CopyStrategy): string {
+    if (!s.copySell) return "不跟卖";
+    return s.sellMode === "ratio"
+      ? `比例 ${Math.round(s.sellValue * 100)}%`
+      : `倍数 ${s.sellValue}`;
+  }
+
   function handleSignal(signal: TradeSignal) {
     // Halt 门禁：Stop/Fail Closed 后晚到的信号绝不进入队列，标记 cancelled 供人工核对。
     // 记录 txHash 到 accepted，确保 Restart 后也不会自动重复执行这笔旧信号。
@@ -921,6 +954,56 @@ export function CopyTrade({
     if (acceptedSignalHashesRef.current.has(signal.txHash)) return;
     acceptedSignalHashesRef.current.set(signal.txHash, signal.blockNumber);
     pruneAccepted(signal.blockNumber);
+
+    // 策略门禁：配置校验 / 最小跟单金额 / 只跟一次 / 跟卖开关（命中即拒绝，不入队）
+    const strat = strategyRef.current;
+    const strategyError = validateStrategy(strat);
+    if (strategyError) {
+      upsertSignalLog({
+        txHash: signal.txHash,
+        direction: signal.direction,
+        tokenSymbol: "",
+        amountText: "",
+        status: "error",
+        summary: `策略配置无效：${strategyError}`,
+      });
+      return;
+    }
+    if (signal.direction === "buy") {
+      if (!shouldFollow(signal.amountInWei, strat)) {
+        upsertSignalLog({
+          txHash: signal.txHash,
+          direction: "buy",
+          tokenSymbol: "",
+          amountText: ethers.formatEther(signal.amountInWei),
+          status: "error",
+          summary: "Leader 买入额低于最小跟单金额阈值，已跳过",
+        });
+        return;
+      }
+      const key = buyOnceKey(signal.leaderAddress, signal.tokenAddress);
+      if (strat.buyOnlyOnce && followedOnceRef.current.has(key)) {
+        upsertSignalLog({
+          txHash: signal.txHash,
+          direction: "buy",
+          tokenSymbol: "",
+          amountText: ethers.formatEther(signal.amountInWei),
+          status: "error",
+          summary: "「只跟一次」已开启，该代币已跟单，跳过",
+        });
+        return;
+      }
+    } else if (!strat.copySell) {
+      upsertSignalLog({
+        txHash: signal.txHash,
+        direction: "sell",
+        tokenSymbol: "",
+        amountText: "",
+        status: "error",
+        summary: "未开启跟卖，已跳过",
+      });
+      return;
+    }
 
     upsertSignalLog({
       txHash: signal.txHash,
@@ -972,6 +1055,24 @@ export function CopyTrade({
 
         const signal = queueRef.current.shift()!;
 
+        // 只跟一次：出队后再次校验，拦截排队期间已跟单的重复信号。
+        // 认领时机放在 followBuy 买入成功后（见下），失败可重试，避免首次失败导致永久跳过。
+        if (signal.direction === "buy" && strategyRef.current.buyOnlyOnce) {
+          const onceKey = buyOnceKey(signal.leaderAddress, signal.tokenAddress);
+          if (followedOnceRef.current.has(onceKey)) {
+            activeSignalHashesRef.current.delete(signal.txHash);
+            upsertSignalLog({
+              txHash: signal.txHash,
+              direction: "buy",
+              tokenSymbol: "",
+              amountText: ethers.formatEther(signal.amountInWei),
+              status: "error",
+              summary: "「只跟一次」已开启，该代币已跟单，跳过",
+            });
+            continue;
+          }
+        }
+
         // 统一资金执行锁（Manual Buy/Sell 与 Auto Buy/Sell 共用同一 gate）
         executionRef.current = true;
         setIsExecuting(true);
@@ -996,6 +1097,21 @@ export function CopyTrade({
 
   async function followBuy(signal: TradeSignal) {
     try {
+      const strat = strategyRef.current;
+      const buyAmountWei = calcBuyAmount(signal.amountInWei, strat);
+      if (buyAmountWei <= 0n) {
+        upsertSignalLog({
+          txHash: signal.txHash,
+          direction: "buy",
+          tokenSymbol: "",
+          amountText: ethers.formatEther(signal.amountInWei),
+          status: "error",
+          summary: "策略计算的买入金额为 0，已跳过",
+        });
+        return;
+      }
+      const buyAmountText = ethers.formatEther(buyAmountWei);
+
       let meta: TokenMetadata;
       try {
         meta = await getTokenMetadata(signal.tokenAddress, provider);
@@ -1017,7 +1133,7 @@ export function CopyTrade({
         tokenSymbol: meta.symbol,
         amountText: ethers.formatEther(signal.amountInWei),
         status: "following",
-        summary: `Leader 买入 ${ethers.formatEther(signal.amountInWei)} ${network.nativeSymbol}，开始跟单`,
+        summary: `Leader 买入 ${ethers.formatEther(signal.amountInWei)} ${network.nativeSymbol}，跟单买入 ${buyAmountText} ${network.nativeSymbol}/钱包（${describeBuyStrategy(strat)}）`,
       });
 
       const slippageBps = slippagePercentToBps(slippageRef.current);
@@ -1026,8 +1142,8 @@ export function CopyTrade({
           role: "follower",
           name: f.name,
           wallet: createWallet(f.privateKey, provider),
-          amountWei: f.buyAmountWei,
-          amountText: f.buyAmountText,
+          amountWei: buyAmountWei,
+          amountText: buyAmountText,
         })
       );
 
@@ -1045,9 +1161,6 @@ export function CopyTrade({
       // 登记 unresolved：自动跟买出现 unknown 时进入全局门禁，等待真实对账
       for (const r of buyResults) {
         if (r.status !== "unknown" || !r.txHash) continue;
-        const fw = followerWallets.find(
-          (f) => f.wallet.address.toLowerCase() === r.address.toLowerCase()
-        );
         const prev = getPosition(network.chainId, r.address, signal.tokenAddress);
         addUnresolved({
           chainId: network.chainId,
@@ -1059,7 +1172,7 @@ export function CopyTrade({
           side: "buy",
           phase: "swap",
           accountingRole: "follower",
-          plannedAmountWei: fw?.amountWei ?? 0n,
+          plannedAmountWei: buyAmountWei,
           balanceBeforeWei: r.balanceBeforeWei,
           snapshotBefore: prev
             ? snapshotOf(prev)
@@ -1073,9 +1186,6 @@ export function CopyTrade({
         if (r.role !== "follower" || r.status !== "success") continue;
         const received = r.receivedAmountWei ?? 0n;
         if (received <= 0n) continue;
-        const fw = followerWallets.find(
-          (f) => f.wallet.address.toLowerCase() === r.address.toLowerCase()
-        );
         upsertPosition(
           network.chainId,
           r.address,
@@ -1083,8 +1193,20 @@ export function CopyTrade({
           meta.symbol,
           meta.decimals,
           received,
-          fw?.amountWei ?? 0n,
+          buyAmountWei,
           r.txHash
+        );
+      }
+      // 只跟一次：仅在确有跟单交易广播（success 或 unknown）后认领该 (Leader, Token)。
+      // 全部失败/未广播时不认领，允许下次 Leader 再买入时重试。
+      if (
+        strategyRef.current.buyOnlyOnce &&
+        buyResults.some(
+          (r) => r.status === "success" || r.status === "unknown"
+        )
+      ) {
+        followedOnceRef.current.add(
+          buyOnceKey(signal.leaderAddress, signal.tokenAddress)
         );
       }
       setPositions(listPositions(network.chainId));
@@ -1139,11 +1261,12 @@ export function CopyTrade({
 
   async function followSell(signal: TradeSignal) {
     try {
+      const strat = strategyRef.current;
       const positions = listPositions(network.chainId);
       const related = positions.filter(
         (p) => p.tokenAddress.toLowerCase() === signal.tokenAddress.toLowerCase()
       );
-      const symbol = related[0]?.tokenSymbol ?? "";
+      const symbol = related[0]?.tokenSymbol ?? shortAddr(signal.tokenAddress);
 
       upsertSignalLog({
         txHash: signal.txHash,
@@ -1151,7 +1274,7 @@ export function CopyTrade({
         tokenSymbol: symbol,
         amountText: "",
         status: "following",
-        summary: "Leader 卖出，开始跟卖（全额卖出）",
+        summary: `Leader 卖出，跟卖（${describeSellStrategy(strat)}）`,
       });
 
       const slippageBps = slippagePercentToBps(slippageRef.current);
@@ -1173,6 +1296,7 @@ export function CopyTrade({
           network,
           supportFeeOnTransfer: supportFotRef.current,
           followers: followerWallets,
+          sellQty: (pos) => calcSellQuantity(pos.amountWei, strat),
         },
         () => {}
       );
@@ -1309,6 +1433,13 @@ export function CopyTrade({
         return;
       }
 
+      // 策略配置校验（Fail Closed）：最小跟单金额开启但非法时，禁止启动监听
+      const strategyError = validateStrategy(strategyRef.current);
+      if (strategyError) {
+        setError(`策略配置无效，无法开始监听：${strategyError}`);
+        return;
+      }
+
       const router = new ethers.Contract(
         network.routerAddress,
         PANCAKE_ROUTER_V2_ABI,
@@ -1344,6 +1475,8 @@ export function CopyTrade({
 
       monitorRef.current = monitor;
       queueLimitReachedRef.current = false;
+      // 新监听会话开始：重置「只跟一次」的 (Leader, Token) 认领集合（session scope）
+      followedOnceRef.current.clear();
       // 启动前确保队列为空，避免携带上一轮 Stop 遗留的 stale signal
       if (queueRef.current.length > 0) {
         markPendingCancelled("重新启动监听前清理遗留信号，请人工核对");
@@ -1365,6 +1498,8 @@ export function CopyTrade({
   function stopMonitor() {
     monitorRef.current?.stop();
     monitorRef.current = null;
+    // 监听会话结束：清空「只跟一次」的认领集合（session scope）
+    followedOnceRef.current.clear();
     // 用户主动停止：停止继续消费 pending 队列并标记 cancelled；
     // 已广播的交易不会被强制取消（drainQueue 中正在 await 的信号会自然收尾）
     haltAuto("自动监听已停止，该信号未执行，请人工核对");
@@ -1375,6 +1510,7 @@ export function CopyTrade({
   const successCount = results.filter((r) => r.status === "success").length;
   const failedCount = results.filter((r) => r.status === "failed").length;
   const unknownCount = results.filter((r) => r.status === "unknown").length;
+  const strategyError = validateStrategy(strategy);
 
   return (
     <div className="space-y-6">
@@ -1621,6 +1757,179 @@ export function CopyTrade({
       </section>
 
       <section className="rounded-xl border border-gray-800 bg-gray-900 p-5">
+        <h2 className="font-semibold mb-3">跟单策略</h2>
+
+        {strategyError && (
+          <p className="mb-3 text-sm text-red-400">策略配置无效：{strategyError}</p>
+        )}
+
+        <div className="grid md:grid-cols-2 gap-4 mb-4">
+          <div>
+            <label className="block text-xs text-gray-400 mb-1">买入方式</label>
+            <select
+              value={strategy.buyMode}
+              onChange={(e) =>
+                setStrategy((s) => ({
+                  ...s,
+                  buyMode: e.target.value as "ratio" | "multiplier",
+                }))
+              }
+              disabled={isExecuting || monitoring}
+              className="w-full px-3 py-2 rounded-md bg-gray-800 border border-gray-700 focus:outline-none focus:border-blue-500 disabled:opacity-50"
+            >
+              <option value="ratio">比例（0~1）</option>
+              <option value="multiplier">倍数（可大于 1）</option>
+            </select>
+          </div>
+          <div>
+            <label className="block text-xs text-gray-400 mb-1">
+              {strategy.buyMode === "ratio" ? "买入比例" : "买入倍数"}
+            </label>
+            <input
+              type="text"
+              value={strategy.buyValue}
+              onChange={(e) => {
+                const v = Number(e.target.value);
+                setStrategy((s) => ({
+                  ...s,
+                  buyValue: Number.isFinite(v) ? v : 0,
+                }));
+              }}
+              disabled={isExecuting || monitoring}
+              placeholder={strategy.buyMode === "ratio" ? "0.5" : "1.0"}
+              className="w-full px-3 py-2 rounded-md bg-gray-800 border border-gray-700 focus:outline-none focus:border-blue-500 disabled:opacity-50"
+            />
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-6 mb-4">
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={strategy.buyOnlyOnce}
+              onChange={(e) =>
+                setStrategy((s) => ({ ...s, buyOnlyOnce: e.target.checked }))
+              }
+              disabled={isExecuting || monitoring}
+              className="accent-blue-600"
+            />
+            只跟一次（本次监听会话内同代币防重复加仓）
+          </label>
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={strategy.buyMinEnabled}
+              onChange={(e) => {
+                const enabled = e.target.checked;
+                setStrategy((s) => {
+                  if (!enabled) {
+                    return {
+                      ...s,
+                      buyMinEnabled: false,
+                      buyMinAmountWei: undefined,
+                    };
+                  }
+                  // 开启时安全解析当前文本；空/非法/0 → undefined，触发 Fail Closed 校验
+                  let wei: bigint | undefined;
+                  try {
+                    const v = ethers.parseEther(buyMinAmountText);
+                    wei = v > 0n ? v : undefined;
+                  } catch {
+                    wei = undefined;
+                  }
+                  return { ...s, buyMinEnabled: true, buyMinAmountWei: wei };
+                });
+              }}
+              disabled={isExecuting || monitoring}
+              className="accent-blue-600"
+            />
+            最小跟单金额
+          </label>
+          {strategy.buyMinEnabled && (
+            <input
+              type="text"
+              value={buyMinAmountText}
+              onChange={(e) => {
+                const text = e.target.value;
+                setBuyMinAmountText(text);
+                setStrategy((s) => {
+                  let wei: bigint | undefined;
+                  try {
+                    const v = ethers.parseEther(text);
+                    wei = v > 0n ? v : undefined;
+                  } catch {
+                    wei = undefined;
+                  }
+                  return { ...s, buyMinAmountWei: wei };
+                });
+              }}
+              disabled={isExecuting || monitoring}
+              placeholder="0.01"
+              className="w-28 px-3 py-2 rounded-md bg-gray-800 border border-gray-700 text-sm focus:outline-none focus:border-blue-500 disabled:opacity-50"
+            />
+          )}
+        </div>
+
+        <div className="border-t border-gray-800 pt-4">
+          <label className="flex items-center gap-2 text-sm mb-3">
+            <input
+              type="checkbox"
+              checked={strategy.copySell}
+              onChange={(e) =>
+                setStrategy((s) => ({ ...s, copySell: e.target.checked }))
+              }
+              disabled={isExecuting || monitoring}
+              className="accent-blue-600"
+            />
+            跟卖（Leader 卖出时跟随卖出）
+          </label>
+
+          {strategy.copySell && (
+            <div className="grid md:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-xs text-gray-400 mb-1">
+                  卖出方式
+                </label>
+                <select
+                  value={strategy.sellMode}
+                  onChange={(e) =>
+                    setStrategy((s) => ({
+                      ...s,
+                      sellMode: e.target.value as "ratio" | "multiplier",
+                    }))
+                  }
+                  disabled={isExecuting || monitoring}
+                  className="w-full px-3 py-2 rounded-md bg-gray-800 border border-gray-700 focus:outline-none focus:border-blue-500 disabled:opacity-50"
+                >
+                  <option value="ratio">比例（0~1）</option>
+                  <option value="multiplier">倍数（截断到持仓）</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs text-gray-400 mb-1">
+                  {strategy.sellMode === "ratio" ? "卖出比例" : "卖出倍数"}
+                </label>
+                <input
+                  type="text"
+                  value={strategy.sellValue}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    setStrategy((s) => ({
+                      ...s,
+                      sellValue: Number.isFinite(v) ? v : 0,
+                    }));
+                  }}
+                  disabled={isExecuting || monitoring}
+                  placeholder={strategy.sellMode === "ratio" ? "1" : "1.0"}
+                  className="w-full px-3 py-2 rounded-md bg-gray-800 border border-gray-700 focus:outline-none focus:border-blue-500 disabled:opacity-50"
+                />
+              </div>
+            </div>
+          )}
+        </div>
+      </section>
+
+      <section className="rounded-xl border border-gray-800 bg-gray-900 p-5">
         <div className="flex items-center justify-between mb-3">
           <h2 className="font-semibold">自动监听</h2>
           <div className="flex items-center gap-3">
@@ -1648,7 +1957,7 @@ export function CopyTrade({
           </div>
         </div>
         <p className="text-xs text-gray-500">
-          监听带单地址的链上买入/卖出，自动触发跟单买入与跟卖（全额卖出）。同一 txHash
+          监听带单地址的链上买入/卖出，按策略触发跟单买入与跟卖。同一 txHash
           只触发一次。
         </p>
 
@@ -1907,6 +2216,7 @@ export function CopyTrade({
           </p>
         </section>
       )}
+
     </div>
   );
 }
