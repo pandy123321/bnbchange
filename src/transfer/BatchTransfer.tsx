@@ -10,7 +10,7 @@ import { createWallet } from "../wallet/wallet";
 import { connectMetaMask, onMetaMaskChange } from "../wallet/metamask";
 import {
   findDuplicates,
-  parseAddresses,
+  parseRecipientInput,
   totalAmountWei,
 } from "./parser";
 import {
@@ -20,13 +20,17 @@ import {
   formatAmount,
   getTokenBalance,
   isNative,
-  parseAmount,
 } from "./token";
 import { runBatchTransfer } from "./transfer";
+import { Blockies, shortAddress } from "./Blockies";
 import { exportTransferCsv } from "../utils/csv";
 import { txExplorerUrl } from "../utils/explorer";
 import { assertExpectedChain } from "../utils/chain";
 import { safeErrorMessage } from "../utils/error";
+
+type Step = 1 | 2 | 3 | 4 | 5;
+
+const STEP_LABELS = ["准备", "收款列表", "预览", "确认", "结果"];
 
 function StatusBadge({ status }: { status: TransferResult["status"] }) {
   const map = {
@@ -44,6 +48,41 @@ function StatusBadge({ status }: { status: TransferResult["status"] }) {
   );
 }
 
+function Stepper({ step }: { step: Step }) {
+  return (
+    <div className="flex items-center gap-2 mb-5 overflow-x-auto">
+      {STEP_LABELS.map((label, i) => {
+        const n = (i + 1) as Step;
+        const active = n === step;
+        const done = n < step;
+        return (
+          <div key={label} className="flex items-center gap-2 shrink-0">
+            <div
+              className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-medium border ${
+                active
+                  ? "bg-blue-600 border-blue-500 text-white"
+                  : done
+                  ? "bg-green-600 border-green-500 text-white"
+                  : "bg-gray-800 border-gray-700 text-gray-400"
+              }`}
+            >
+              {done ? "✓" : n}
+            </div>
+            <span
+              className={`text-sm ${
+                active ? "text-gray-100" : done ? "text-green-400" : "text-gray-500"
+              }`}
+            >
+              {label}
+            </span>
+            {n < 5 && <span className="text-gray-700">—</span>}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 export function BatchTransfer({
   network,
   provider,
@@ -55,13 +94,14 @@ export function BatchTransfer({
   rpcReady: boolean;
   onExecutingChange: (executing: boolean) => void;
 }) {
+  const [step, setStep] = useState<Step>(1);
+
   const [walletMode, setWalletMode] = useState<"privateKey" | "metamask">(
     "privateKey"
   );
   const [privateKey, setPrivateKey] = useState("");
   const [wallet, setWallet] = useState<SignerWallet | null>(null);
 
-  // 币种选择
   const [token, setToken] = useState<TokenConfig>(network.tokens[0]);
   const [isCustom, setIsCustom] = useState(false);
   const [customAddress, setCustomAddress] = useState("");
@@ -69,15 +109,21 @@ export function BatchTransfer({
   const [balanceWei, setBalanceWei] = useState<bigint | null>(null);
   const [nativeBalanceWei, setNativeBalanceWei] = useState<bigint | null>(null);
   const [recipientsText, setRecipientsText] = useState("");
-  const [amountText, setAmountText] = useState("");
   const [parsed, setParsed] = useState<TransferRecipient[] | null>(null);
-  const [summary, setSummary] = useState("");
+  const [gasTotalWei, setGasTotalWei] = useState<bigint | null>(null);
+  const [dupes, setDupes] = useState<string[]>([]);
+  const [largeAck, setLargeAck] = useState(false);
   const [results, setResults] = useState<TransferResult[]>([]);
   const [isExecuting, setIsExecuting] = useState(false);
   const [error, setError] = useState("");
+  const [dragOver, setDragOver] = useState(false);
   const executionRef = useRef(false);
   const metaSubRef = useRef<(() => void) | null>(null);
   const balanceReqRef = useRef(0);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // 大额冷静警告阈值：总额 > 10 个代币单位（按代币 decimals 折算）
+  const largeAmountWei = 10n * 10n ** BigInt(token.decimals);
 
   useEffect(() => {
     return () => metaSubRef.current?.();
@@ -92,7 +138,7 @@ export function BatchTransfer({
         getTokenBalance(tk, w.address, provider),
         provider.getBalance(w.address),
       ]);
-      if (reqId !== balanceReqRef.current) return; // 丢弃过期结果
+      if (reqId !== balanceReqRef.current) return;
       setBalanceWei(tokenBal);
       setNativeBalanceWei(nativeBal);
     } catch (e) {
@@ -102,12 +148,13 @@ export function BatchTransfer({
 
   function invalidateParsed() {
     setParsed(null);
-    setSummary("");
+    setDupes([]);
+    setGasTotalWei(null);
+    setLargeAck(false);
   }
 
   function handlePrivateKeyChange(value: string) {
     setPrivateKey(value);
-    // 源输入变化 → 旧 wallet / 余额立即失效
     setWallet(null);
     setBalanceWei(null);
     setNativeBalanceWei(null);
@@ -116,7 +163,6 @@ export function BatchTransfer({
   function switchWalletMode(mode: "privateKey" | "metamask") {
     if (isExecuting) return;
     setWalletMode(mode);
-    // 模式切换 → 旧 wallet / 余额立即失效
     setWallet(null);
     setBalanceWei(null);
     setNativeBalanceWei(null);
@@ -155,13 +201,6 @@ export function BatchTransfer({
 
   function handleRecipientsChange(value: string) {
     setRecipientsText(value);
-    // 源输入变化 → 旧 parsed / summary 立即失效
-    invalidateParsed();
-  }
-
-  function handleAmountChange(value: string) {
-    setAmountText(value);
-    // 金额变化 → 旧 parsed / summary 立即失效
     invalidateParsed();
   }
 
@@ -214,49 +253,63 @@ export function BatchTransfer({
     }
   }
 
-  function validate() {
-    setError("");
-    setSummary("");
-    setParsed(null);
-
+  async function computeGas(recipients: TransferRecipient[]) {
+    if (!wallet) return;
+    setGasTotalWei(null);
+    let total = 0n;
     try {
-      if (!amountText.trim()) {
-        throw new Error("请填写每笔金额");
+      for (const r of recipients) {
+        const gasLimit = await estimateTransferGas(
+          wallet,
+          token,
+          r.address,
+          r.amountWei
+        );
+        const feeData = await provider.getFeeData();
+        const gasPrice =
+          feeData.gasPrice ?? feeData.maxFeePerGas ?? 1_000_000_000n;
+        total += gasLimit * gasPrice;
       }
+      setGasTotalWei(total);
+    } catch {
+      setGasTotalWei(null);
+    }
+  }
 
-      const amountWei = parseAmount(amountText, token.decimals);
-      if (amountWei <= 0n) {
-        throw new Error("每笔金额必须大于 0");
-      }
+  function goToStep2() {
+    setError("");
+    if (!wallet) {
+      setError("请先连接发送钱包（输入私钥或连接小狐狸）");
+      return;
+    }
+    setStep(2);
+  }
 
-      const addrs = parseAddresses(recipientsText);
-      const recipients: TransferRecipient[] = addrs.map((a) => ({
-        lineNo: a.lineNo,
-        address: a.address,
-        amountText,
-        amountWei,
-      }));
-
-      const dupes = findDuplicates(recipients);
-      const total = totalAmountWei(recipients);
-
+  function goToStep3() {
+    setError("");
+    try {
+      const recipients = parseRecipientInput(recipientsText, token.decimals);
       setParsed(recipients);
-
-      const unit = isNative(token) ? "wei" : "最小单位";
-      const parts = [
-        `共 ${recipients.length} 笔，每笔 ${amountText} ${token.symbol}（= ${amountWei} ${unit}），合计 ${formatAmount(total, token.decimals)} ${token.symbol}（= ${total} ${unit}）`,
-      ];
-      if (dupes.length) {
-        parts.push(`检测到重复地址：${dupes.join(", ")}（不会自动合并）`);
-      }
-      setSummary(parts.join("；"));
+      setDupes(findDuplicates(recipients));
+      setGasTotalWei(null);
+      setStep(3);
+      void computeGas(recipients);
     } catch (e) {
       setError(safeErrorMessage(e));
     }
   }
 
-  async function start() {
+  function goToStep4() {
+    if (!parsed) return;
+    setError("");
+    setLargeAck(false);
+    setStep(4);
+  }
+
+  async function execute() {
     if (executionRef.current) return;
+    if (!parsed) return;
+
     executionRef.current = true;
     setIsExecuting(true);
     onExecutingChange(true);
@@ -267,28 +320,13 @@ export function BatchTransfer({
         return;
       }
       if (!wallet) {
-        setError("请先连接发送钱包（输入私钥或连接小狐狸）");
-        return;
-      }
-      if (!parsed) {
-        setError("请先校验收款列表");
+        setError("请先连接发送钱包");
         return;
       }
 
       setError("");
 
       const totalValue = totalAmountWei(parsed);
-
-      // 二次确认：明确展示每笔金额（含 wei）与总笔数，防止误操作
-      const unit = isNative(token) ? "wei" : "最小单位";
-      const confirmMsg =
-        `即将向 ${parsed.length} 个地址发起转账：\n` +
-        `每笔 ${parsed[0].amountText} ${token.symbol}（= ${parsed[0].amountWei} ${unit}）\n` +
-        `合计 ${formatAmount(totalValue, token.decimals)} ${token.symbol}（= ${totalValue} ${unit}）\n\n` +
-        `确认继续？`;
-      if (!window.confirm(confirmMsg)) {
-        return;
-      }
 
       // Gas 价格在批量估算前读取一次，避免每笔重复读取
       let gasPrice: bigint;
@@ -336,7 +374,6 @@ export function BatchTransfer({
         return;
       }
 
-      // 广播前再次核验实际 Chain ID（Fail Closed）——使用实际签名的钱包 Provider
       await assertExpectedChain(wallet.provider!, network.chainId);
 
       const initial: TransferResult[] = parsed.map((r) => ({
@@ -345,6 +382,7 @@ export function BatchTransfer({
         status: "processing",
       }));
       setResults(initial);
+      setStep(5);
 
       await runBatchTransfer(
         wallet,
@@ -368,211 +406,452 @@ export function BatchTransfer({
     }
   }
 
+  function downloadTemplate() {
+    const header = "address,amount";
+    const example = `0x000000000000000000000000000000000000dEaD,1.0\n0x000000000000000000000000000000000000dEaD,0.5`;
+    const blob = new Blob(["\uFEFF" + header + "\n" + example], {
+      type: "text/csv;charset=utf-8;",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "批量转账模板.csv";
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function handleFile(file: File) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      setRecipientsText(String(reader.result ?? ""));
+      invalidateParsed();
+    };
+    reader.onerror = () => setError("文件读取失败");
+    reader.readAsText(file);
+  }
+
+  function onDrop(e: React.DragEvent) {
+    e.preventDefault();
+    setDragOver(false);
+    const file = e.dataTransfer.files?.[0];
+    if (file) handleFile(file);
+  }
+
   const successCount = results.filter((r) => r.status === "success").length;
   const failedCount = results.filter((r) => r.status === "failed").length;
   const unknownCount = results.filter((r) => r.status === "unknown").length;
-
   const selectValue = isCustom ? "__custom__" : token.symbol;
+  const totalWei = parsed ? totalAmountWei(parsed) : 0n;
+  const isLarge = totalWei > largeAmountWei;
 
   return (
     <div className="space-y-6">
-      <section className="rounded-xl border border-gray-800 bg-gray-900 p-5">
-        <h2 className="font-semibold mb-3">发送钱包</h2>
+      <Stepper step={step} />
 
-        <div className="inline-flex rounded-lg bg-gray-800 border border-gray-700 p-1 mb-4">
-          <button
-            onClick={() => switchWalletMode("privateKey")}
-            disabled={isExecuting}
-            className={`px-3 py-1.5 rounded-md text-sm ${
-              walletMode === "privateKey"
-                ? "bg-gray-600 text-white"
-                : "text-gray-400 hover:text-gray-200"
-            } disabled:opacity-50`}
-          >
-            输入私钥
-          </button>
-          <button
-            onClick={() => switchWalletMode("metamask")}
-            disabled={isExecuting}
-            className={`px-3 py-1.5 rounded-md text-sm ${
-              walletMode === "metamask"
-                ? "bg-gray-600 text-white"
-                : "text-gray-400 hover:text-gray-200"
-            } disabled:opacity-50`}
-          >
-            连接小狐狸
-          </button>
-        </div>
+      {step === 1 && (
+        <section className="rounded-xl border border-gray-800 bg-gray-900 p-5">
+          <h2 className="font-semibold mb-3">发送钱包</h2>
 
-        {walletMode === "privateKey" ? (
-          <>
-            <label className="block text-xs text-gray-400 mb-1">发送方私钥</label>
-            <div className="flex gap-2">
-              <input
-                type="password"
-                value={privateKey}
-                onChange={(e) => handlePrivateKeyChange(e.target.value)}
-                disabled={isExecuting}
-                placeholder="0x..."
-                className="flex-1 px-3 py-2 rounded-md bg-gray-800 border border-gray-700 font-mono focus:outline-none focus:border-blue-500 disabled:opacity-50"
-              />
-              <button
-                onClick={loadWallet}
-                disabled={isExecuting || !rpcReady}
-                className="px-4 py-2 rounded-md bg-gray-700 hover:bg-gray-600 disabled:opacity-50"
-              >
-                读取钱包
-              </button>
-            </div>
-          </>
-        ) : (
-          <div className="flex gap-2">
+          <div className="inline-flex rounded-lg bg-gray-800 border border-gray-700 p-1 mb-4">
             <button
-              onClick={connectMeta}
-              disabled={isExecuting || !rpcReady}
-              className="px-4 py-2 rounded-md bg-orange-600 hover:bg-orange-500 disabled:opacity-50 font-medium"
+              onClick={() => switchWalletMode("privateKey")}
+              disabled={isExecuting}
+              className={`px-3 py-1.5 rounded-md text-sm ${
+                walletMode === "privateKey"
+                  ? "bg-gray-600 text-white"
+                  : "text-gray-400 hover:text-gray-200"
+              } disabled:opacity-50`}
+            >
+              输入私钥
+            </button>
+            <button
+              onClick={() => switchWalletMode("metamask")}
+              disabled={isExecuting}
+              className={`px-3 py-1.5 rounded-md text-sm ${
+                walletMode === "metamask"
+                  ? "bg-gray-600 text-white"
+                  : "text-gray-400 hover:text-gray-200"
+              } disabled:opacity-50`}
             >
               连接小狐狸
             </button>
-            {wallet && (
-              <button
-                onClick={disconnectMeta}
-                disabled={isExecuting}
-                className="px-4 py-2 rounded-md bg-gray-700 hover:bg-gray-600 disabled:opacity-50"
-              >
-                断开
-              </button>
-            )}
           </div>
-        )}
 
-        {wallet && (
-          <div className="mt-3 text-sm space-y-1">
-            <div>
-              <span className="text-gray-400">地址: </span>
-              <span className="font-mono break-all">{wallet.address}</span>
-            </div>
-            {balanceWei != null && (
-              <div>
-                <span className="text-gray-400">币种余额: </span>
-                <span className="font-semibold">
-                  {formatAmount(balanceWei, token.decimals)} {token.symbol}
-                </span>
-              </div>
-            )}
-            {nativeBalanceWei != null && (
-              <div>
-                <span className="text-gray-400">原生币余额（付 Gas）: </span>
-                <span className="text-gray-300">
-                  {ethers.formatEther(nativeBalanceWei)} {network.nativeSymbol}
-                </span>
-              </div>
-            )}
-          </div>
-        )}
-      </section>
-
-      <section className="rounded-xl border border-gray-800 bg-gray-900 p-5">
-        <h2 className="font-semibold mb-3">币种</h2>
-        <div className="grid md:grid-cols-2 gap-4">
-          <div>
-            <label className="block text-xs text-gray-400 mb-1">选择币种</label>
-            <select
-              value={selectValue}
-              onChange={(e) => handleTokenSelect(e.target.value)}
-              disabled={isExecuting}
-              className="w-full px-3 py-2 rounded-md bg-gray-800 border border-gray-700 focus:outline-none focus:border-blue-500 disabled:opacity-50"
-            >
-              {network.tokens.map((t) => (
-                <option key={t.symbol} value={t.symbol}>
-                  {t.symbol}
-                </option>
-              ))}
-              <option value="__custom__">自定义代币…</option>
-            </select>
-          </div>
-          {isCustom && (
-            <div>
-              <label className="block text-xs text-gray-400 mb-1">代币合约地址</label>
+          {walletMode === "privateKey" ? (
+            <>
+              <label className="block text-xs text-gray-400 mb-1">
+                发送方私钥
+              </label>
               <div className="flex gap-2">
                 <input
-                  type="text"
-                  value={customAddress}
-                  onChange={(e) => handleCustomAddressChange(e.target.value)}
+                  type="password"
+                  value={privateKey}
+                  onChange={(e) => handlePrivateKeyChange(e.target.value)}
                   disabled={isExecuting}
                   placeholder="0x..."
                   className="flex-1 px-3 py-2 rounded-md bg-gray-800 border border-gray-700 font-mono focus:outline-none focus:border-blue-500 disabled:opacity-50"
                 />
                 <button
-                  onClick={loadCustomToken}
+                  onClick={loadWallet}
                   disabled={isExecuting || !rpcReady}
                   className="px-4 py-2 rounded-md bg-gray-700 hover:bg-gray-600 disabled:opacity-50"
                 >
-                  读取
+                  读取钱包
                 </button>
               </div>
+            </>
+          ) : (
+            <div className="flex gap-2">
+              <button
+                onClick={connectMeta}
+                disabled={isExecuting || !rpcReady}
+                className="px-4 py-2 rounded-md bg-orange-600 hover:bg-orange-500 disabled:opacity-50 font-medium"
+              >
+                连接小狐狸
+              </button>
+              {wallet && (
+                <button
+                  onClick={disconnectMeta}
+                  disabled={isExecuting}
+                  className="px-4 py-2 rounded-md bg-gray-700 hover:bg-gray-600 disabled:opacity-50"
+                >
+                  断开
+                </button>
+              )}
             </div>
           )}
-        </div>
-        {token.address && (
-          <p className="mt-2 text-xs text-gray-500 font-mono break-all">
-            {token.name} · {token.address}
+
+          {wallet && (
+            <div className="mt-3 text-sm space-y-1">
+              <div className="flex items-center gap-2">
+                <Blockies address={wallet.address} size={20} />
+                <span className="font-mono">{shortAddress(wallet.address)}</span>
+              </div>
+              {balanceWei != null && (
+                <div>
+                  <span className="text-gray-400">币种余额: </span>
+                  <span className="font-semibold">
+                    {formatAmount(balanceWei, token.decimals)} {token.symbol}
+                  </span>
+                </div>
+              )}
+              {nativeBalanceWei != null && (
+                <div>
+                  <span className="text-gray-400">原生币余额（付 Gas）: </span>
+                  <span className="text-gray-300">
+                    {ethers.formatEther(nativeBalanceWei)} {network.nativeSymbol}
+                  </span>
+                </div>
+              )}
+            </div>
+          )}
+
+          <div className="mt-5">
+            <h2 className="font-semibold mb-3">币种</h2>
+            <div className="grid md:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-xs text-gray-400 mb-1">
+                  选择币种
+                </label>
+                <select
+                  value={selectValue}
+                  onChange={(e) => handleTokenSelect(e.target.value)}
+                  disabled={isExecuting}
+                  className="w-full px-3 py-2 rounded-md bg-gray-800 border border-gray-700 focus:outline-none focus:border-blue-500 disabled:opacity-50"
+                >
+                  {network.tokens.map((t) => (
+                    <option key={t.symbol} value={t.symbol}>
+                      {t.symbol}
+                    </option>
+                  ))}
+                  <option value="__custom__">自定义代币…</option>
+                </select>
+              </div>
+              {isCustom && (
+                <div>
+                  <label className="block text-xs text-gray-400 mb-1">
+                    代币合约地址
+                  </label>
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      value={customAddress}
+                      onChange={(e) => handleCustomAddressChange(e.target.value)}
+                      disabled={isExecuting}
+                      placeholder="0x..."
+                      className="flex-1 px-3 py-2 rounded-md bg-gray-800 border border-gray-700 font-mono focus:outline-none focus:border-blue-500 disabled:opacity-50"
+                    />
+                    <button
+                      onClick={loadCustomToken}
+                      disabled={isExecuting || !rpcReady}
+                      className="px-4 py-2 rounded-md bg-gray-700 hover:bg-gray-600 disabled:opacity-50"
+                    >
+                      读取
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+            {token.address && (
+              <p className="mt-2 text-xs text-gray-500 font-mono break-all">
+                {token.name} · {token.address}
+              </p>
+            )}
+          </div>
+
+          {error && <p className="mt-3 text-sm text-red-400">{error}</p>}
+
+          <div className="mt-5 flex justify-end">
+            <button
+              onClick={goToStep2}
+              className="px-5 py-2 rounded-md bg-blue-600 hover:bg-blue-500 font-medium"
+            >
+              下一步
+            </button>
+          </div>
+        </section>
+      )}
+
+      {step === 2 && (
+        <section className="rounded-xl border border-gray-800 bg-gray-900 p-5">
+          <h2 className="font-semibold mb-3">收款列表</h2>
+          <p className="text-xs text-gray-500 mb-3">
+            每行一笔，格式{" "}
+            <code className="text-gray-300">address,amount</code>
+            ；支持粘贴、CSV/JSON 拖拽或文件导入。
           </p>
-        )}
-      </section>
 
-      <section className="rounded-xl border border-gray-800 bg-gray-900 p-5">
-        <h2 className="font-semibold mb-3">收款列表</h2>
-
-        <div className="mb-4">
-          <label className="block text-xs text-gray-400 mb-1">
-            每笔金额（{token.symbol}）
-          </label>
-          <input
-            type="text"
-            value={amountText}
-            onChange={(e) => handleAmountChange(e.target.value)}
-            disabled={isExecuting}
-            placeholder="0.1"
-            className="w-full px-3 py-2 rounded-md bg-gray-800 border border-gray-700 focus:outline-none focus:border-blue-500 disabled:opacity-50"
-          />
-          <p className="mt-1 text-xs text-gray-500">
-            所有收款地址均按此固定金额转账
-          </p>
-        </div>
-
-        <label className="block text-xs text-gray-400 mb-1">收款地址（每行一个）</label>
-        <textarea
-          value={recipientsText}
-          onChange={(e) => handleRecipientsChange(e.target.value)}
-          disabled={isExecuting}
-          rows={6}
-          placeholder={"0xAAA...\n0xBBB...\n0xCCC..."}
-          className="w-full px-3 py-2 rounded-md bg-gray-800 border border-gray-700 font-mono text-sm focus:outline-none focus:border-blue-500 disabled:opacity-50"
-        />
-
-        <div className="mt-3 flex items-center gap-3">
-          <button
-            onClick={validate}
-            disabled={isExecuting}
-            className="px-4 py-2 rounded-md bg-gray-700 hover:bg-gray-600 disabled:opacity-50"
+          <div
+            onDragOver={(e) => {
+              e.preventDefault();
+              setDragOver(true);
+            }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={onDrop}
+            className={`border-2 border-dashed rounded-lg p-1 transition-colors ${
+              dragOver ? "border-blue-500 bg-blue-500/5" : "border-gray-700"
+            }`}
           >
-            校验
-          </button>
-          <button
-            onClick={start}
-            disabled={isExecuting || !rpcReady || !wallet || !parsed}
-            className="px-4 py-2 rounded-md bg-blue-600 hover:bg-blue-500 disabled:opacity-50 font-medium"
-          >
-            {isExecuting ? "执行中..." : "开始批量转账"}
-          </button>
-        </div>
+            <textarea
+              value={recipientsText}
+              onChange={(e) => handleRecipientsChange(e.target.value)}
+              disabled={isExecuting}
+              rows={8}
+              placeholder={"0xAAA... , 0.1\n0xBBB... , 0.2\n0xCCC... , 0.3"}
+              className="w-full px-3 py-2 rounded-md bg-gray-800 border border-gray-700 font-mono text-sm focus:outline-none focus:border-blue-500 disabled:opacity-50"
+            />
+          </div>
 
-        {summary && <p className="mt-3 text-sm text-gray-300">{summary}</p>}
-        {error && <p className="mt-3 text-sm text-red-400">{error}</p>}
-      </section>
+          <div className="mt-3 flex flex-wrap items-center gap-3">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".csv,.json,.txt"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) handleFile(f);
+                e.target.value = "";
+              }}
+            />
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              disabled={isExecuting}
+              className="px-4 py-2 rounded-md bg-gray-700 hover:bg-gray-600 disabled:opacity-50"
+            >
+              导入 CSV/JSON
+            </button>
+            <button
+              onClick={downloadTemplate}
+              disabled={isExecuting}
+              className="px-4 py-2 rounded-md bg-gray-700 hover:bg-gray-600 disabled:opacity-50"
+            >
+              下载模板
+            </button>
+          </div>
 
-      {results.length > 0 && (
+          {error && <p className="mt-3 text-sm text-red-400">{error}</p>}
+
+          <div className="mt-5 flex justify-between">
+            <button
+              onClick={() => setStep(1)}
+              disabled={isExecuting}
+              className="px-4 py-2 rounded-md bg-gray-700 hover:bg-gray-600 disabled:opacity-50"
+            >
+              上一步
+            </button>
+            <button
+              onClick={goToStep3}
+              disabled={isExecuting}
+              className="px-5 py-2 rounded-md bg-blue-600 hover:bg-blue-500 font-medium"
+            >
+              下一步
+            </button>
+          </div>
+        </section>
+      )}
+
+      {step === 3 && parsed && (
+        <section className="rounded-xl border border-gray-800 bg-gray-900 p-5">
+          <h2 className="font-semibold mb-3">预览汇总</h2>
+
+          <div className="grid md:grid-cols-3 gap-4 mb-4">
+            <div className="rounded-lg bg-gray-800 p-4">
+              <div className="text-xs text-gray-400">收款笔数</div>
+              <div className="text-2xl font-semibold">{parsed.length}</div>
+            </div>
+            <div className="rounded-lg bg-gray-800 p-4">
+              <div className="text-xs text-gray-400">
+                合计（{token.symbol}）
+              </div>
+              <div className="text-2xl font-semibold">
+                {formatAmount(totalWei, token.decimals)}
+              </div>
+            </div>
+            <div className="rounded-lg bg-gray-800 p-4">
+              <div className="text-xs text-gray-400">
+                预估 Gas（{network.nativeSymbol}）
+              </div>
+              <div className="text-2xl font-semibold">
+                {gasTotalWei == null
+                  ? wallet
+                    ? "估算中…"
+                    : "连接钱包后显示"
+                  : ethers.formatEther(gasTotalWei)}
+              </div>
+            </div>
+          </div>
+
+          {dupes.length > 0 && (
+            <div className="mb-4 rounded-lg border border-yellow-800 bg-yellow-900/20 px-4 py-2 text-sm text-yellow-300">
+              检测到重复地址：{dupes.map((d) => shortAddress(d)).join(", ")}
+              （不会自动合并，将分别转账）
+            </div>
+          )}
+
+          <div className="max-h-64 overflow-y-auto rounded-lg border border-gray-800">
+            <table className="w-full text-sm">
+              <thead className="sticky top-0 bg-gray-900">
+                <tr className="text-left text-gray-400 border-b border-gray-800">
+                  <th className="py-2 px-3">#</th>
+                  <th className="py-2 px-3">地址</th>
+                  <th className="py-2 px-3">金额</th>
+                </tr>
+              </thead>
+              <tbody>
+                {parsed.map((r, i) => (
+                  <tr key={i} className="border-b border-gray-800/50">
+                    <td className="py-2 px-3 text-gray-400">{i + 1}</td>
+                    <td className="py-2 px-3">
+                      <span className="flex items-center gap-2">
+                        <Blockies address={r.address} size={18} />
+                        <span className="font-mono text-xs">
+                          {shortAddress(r.address)}
+                        </span>
+                      </span>
+                    </td>
+                    <td className="py-2 px-3">
+                      {r.amountText} {token.symbol}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {error && <p className="mt-3 text-sm text-red-400">{error}</p>}
+
+          <div className="mt-5 flex justify-between">
+            <button
+              onClick={() => setStep(2)}
+              disabled={isExecuting}
+              className="px-4 py-2 rounded-md bg-gray-700 hover:bg-gray-600 disabled:opacity-50"
+            >
+              上一步
+            </button>
+            <button
+              onClick={goToStep4}
+              disabled={isExecuting}
+              className="px-5 py-2 rounded-md bg-blue-600 hover:bg-blue-500 font-medium"
+            >
+              下一步
+            </button>
+          </div>
+        </section>
+      )}
+
+      {step === 4 && parsed && (
+        <section className="rounded-xl border border-gray-800 bg-gray-900 p-5">
+          <h2 className="font-semibold mb-3">确认转账</h2>
+
+          <div className="rounded-lg bg-gray-800 p-4 mb-4 space-y-1 text-sm">
+            <div className="flex justify-between">
+              <span className="text-gray-400">收款笔数</span>
+              <span>{parsed.length} 笔</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-gray-400">
+                合计 {token.symbol}
+              </span>
+              <span className="font-semibold">
+                {formatAmount(totalWei, token.decimals)}
+              </span>
+            </div>
+            {gasTotalWei != null && (
+              <div className="flex justify-between">
+                <span className="text-gray-400">
+                  预估 Gas（{network.nativeSymbol}）
+                </span>
+                <span>{ethers.formatEther(gasTotalWei)}</span>
+              </div>
+            )}
+          </div>
+
+          {isLarge && (
+            <div className="mb-4 rounded-lg border border-red-800 bg-red-900/20 px-4 py-3">
+              <p className="text-sm text-red-300 font-medium mb-2">
+                大额转账冷静警告
+              </p>
+              <p className="text-xs text-red-300/80">
+                本次转账总额超过{" "}
+                {formatAmount(largeAmountWei, token.decimals)} {token.symbol}
+                ，请仔细核对收款地址，确认无误后再继续。
+              </p>
+              <label className="flex items-center gap-2 text-sm mt-2">
+                <input
+                  type="checkbox"
+                  checked={largeAck}
+                  onChange={(e) => setLargeAck(e.target.checked)}
+                  disabled={isExecuting}
+                  className="accent-red-600"
+                />
+                我已核对收款地址与金额，了解转账不可撤销
+              </label>
+            </div>
+          )}
+
+          {error && <p className="mt-3 text-sm text-red-400">{error}</p>}
+
+          <div className="mt-5 flex justify-between">
+            <button
+              onClick={() => setStep(3)}
+              disabled={isExecuting}
+              className="px-4 py-2 rounded-md bg-gray-700 hover:bg-gray-600 disabled:opacity-50"
+            >
+              上一步
+            </button>
+            <button
+              onClick={execute}
+              disabled={isExecuting || !rpcReady || (isLarge && !largeAck)}
+              className="px-5 py-2 rounded-md bg-red-600 hover:bg-red-500 disabled:opacity-50 font-medium"
+            >
+              {isExecuting ? "执行中..." : "确认并转账"}
+            </button>
+          </div>
+        </section>
+      )}
+
+      {step === 5 && (
         <section className="rounded-xl border border-gray-800 bg-gray-900 p-5">
           <div className="flex items-center justify-between mb-3">
             <h2 className="font-semibold">结果</h2>
@@ -589,6 +868,15 @@ export function BatchTransfer({
             </div>
           </div>
 
+          {successCount === results.length && results.length > 0 && (
+            <div className="mb-4 rounded-lg border border-green-800 bg-green-900/20 px-4 py-3 flex items-center gap-2 animate-pulse">
+              <span className="text-green-400 text-lg">✓</span>
+              <span className="text-sm text-green-300">
+                全部转账已完成
+              </span>
+            </div>
+          )}
+
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
@@ -602,7 +890,14 @@ export function BatchTransfer({
               <tbody>
                 {results.map((r, i) => (
                   <tr key={i} className="border-b border-gray-800/50">
-                    <td className="py-2 pr-4 font-mono text-xs break-all">{r.address}</td>
+                    <td className="py-2 pr-4">
+                      <span className="flex items-center gap-2">
+                        <Blockies address={r.address} size={18} />
+                        <span className="font-mono text-xs">
+                          {shortAddress(r.address)}
+                        </span>
+                      </span>
+                    </td>
                     <td className="py-2 pr-4">
                       {r.amount} {token.symbol}
                     </td>
@@ -636,12 +931,29 @@ export function BatchTransfer({
             </table>
           </div>
 
-          <button
-            onClick={() => exportTransferCsv(results)}
-            className="mt-4 px-4 py-2 rounded-md bg-gray-700 hover:bg-gray-600 text-sm"
-          >
-            导出 CSV
-          </button>
+          <div className="mt-4 flex gap-3">
+            <button
+              onClick={() => exportTransferCsv(results)}
+              className="px-4 py-2 rounded-md bg-gray-700 hover:bg-gray-600 text-sm"
+            >
+              导出 CSV
+            </button>
+            <button
+              onClick={() => {
+                setStep(1);
+                setRecipientsText("");
+                setParsed(null);
+                setResults([]);
+                setDupes([]);
+                setGasTotalWei(null);
+                setLargeAck(false);
+              }}
+              disabled={isExecuting}
+              className="px-4 py-2 rounded-md bg-blue-600 hover:bg-blue-500 text-sm"
+            >
+              开始新转账
+            </button>
+          </div>
         </section>
       )}
     </div>
